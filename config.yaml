@@ -1,0 +1,471 @@
+# =============================================================================
+# GCrawler Configuration File
+# =============================================================================
+# This configuration file controls all aspects of the GCrawler system
+# including API server, crawler, data export, webhooks, and more.
+#
+# Environment variables can override these settings using the format:
+# GCRAWLER_SECTION_KEY (e.g., GCRAWLER_API_SERVER_HOST)
+
+# Global configuration
+# =============================================================================
+environment: development  # Options: development, production, testing
+version: 1.0.0
+
+# API Server Configuration
+# =============================================================================
+api_server:
+  host: 0.0.0.0  # Bind to all interfaces
+  port: 8000  # Default API port
+  workers: 4  # Number of worker processes (production: set to 2x number of CPUs)
+  reload: true  # Auto-reload on code changes (set to false in production)
+  
+  # API keys (list of valid keys)
+  # In production, use environment variables or a secure vault
+  api_keys:
+    - default-dev-key-replace-in-production
+    # Add more keys as needed
+  
+  # Rate limiting settings
+  rate_limiting:
+    enabled: true
+    window: 60  # Time window in seconds
+    max_requests: 100  # Maximum requests per window
+    by_ip: true  # Rate limit by IP address
+    by_api_key: true  # Also rate limit by API key
+  
+  # CORS settings
+  cors:
+    enabled: true
+    allow_origins:
+      - "*"  # In production, specify exact domains
+    allow_methods:
+      - GET
+      - POST
+      - PUT
+      - DELETE
+    allow_headers:
+      - X-API-Key
+      - Content-Type
+    allow_credentials: true
+
+# Database Configuration
+# =============================================================================
+database:
+  # Queue database
+  queue:
+    type: sqlite  # Options: sqlite, mysql, postgresql
+    path: data/queue.db  # For SQLite
+    # Connection parameters for other database types
+    host: localhost
+    port: 5432
+    name: gcrawler_queue
+    user: gcrawler
+    password: change_me_in_production
+    pool_size: 5
+    max_overflow: 10
+    timeout: 30
+  
+  # Results database (for storing crawl results)
+  results:
+    type: sqlite
+    path: data/results.db
+    # Connection parameters for other database types
+    host: localhost
+    port: 5432
+    name: gcrawler_results
+    user: gcrawler
+    password: change_me_in_production
+    pool_size: 5
+    max_overflow: 10
+    timeout: 30
+  
+  # Webhook events database
+  webhook_events:
+    type: sqlite
+    path: data/webhook_events.db
+    # Connection parameters for other database types
+    host: localhost
+    port: 5432
+    name: gcrawler_webhooks
+    user: gcrawler
+    password: change_me_in_production
+    pool_size: 5
+    max_overflow: 10
+    timeout: 30
+
+# Crawler Configuration
+# =============================================================================
+crawler:
+  # Browser settings
+  browser:
+    max_browsers: 2  # Maximum number of concurrent browsers (increase in production)
+    headless: true  # Run browsers in headless mode
+    browser_type: chromium  # Options: chromium, firefox, webkit
+    executable_path: null  # Path to browser executable (null for default)
+    user_data_dir: data/browser_data  # Browser user data directory
+    
+    # Browser launch options
+    launch_options:
+      args:
+        - --no-sandbox
+        - --disable-setuid-sandbox
+        - --disable-dev-shm-usage
+        - --disable-accelerated-2d-canvas
+        - --disable-gpu
+      ignore_https_errors: true
+      slow_mo: 50  # Slow down browser operations by ms (0 for no delay)
+    
+    # Humanization settings
+    humanize: true  # Simulate human behavior
+    humanize_options:
+      mouse_movements: true
+      random_scrolling: true
+      typing_speed: 
+        min: 50  # Minimum typing speed (ms per character)
+        max: 150  # Maximum typing speed
+  
+  # URL processing settings
+  url_processing:
+    batch_size: 10  # Number of URLs to process in a batch
+    url_delay: 1.0  # Delay between URLs in seconds
+    max_retries: 3  # Maximum number of retries for failed URLs
+    retry_delay: 5.0  # Delay between retries in seconds
+    max_depth: 3  # Maximum crawl depth (0 for no limit)
+    max_total_urls: 1000000  # Maximum total URLs to process
+  
+  # Resource handling
+  resources:
+    timeout: 30  # Page load timeout in seconds
+    wait_until: networkidle  # Options: load, domcontentloaded, networkidle
+    block_resources:  # Resource types to block
+      - stylesheet
+      - image
+      - media
+      - font
+      - other
+    
+    # JavaScript handling
+    javascript:
+      enabled: true  # Enable JavaScript
+      execute_on_load: true  # Execute custom JS on page load
+      custom_scripts:  # Custom JavaScript to execute on pages
+        - path: scripts/extract_data.js
+          when: after_load
+  
+  # Proxy configuration
+  proxy:
+    enabled: false
+    server: null  # e.g., http://proxy.example.com:8080
+    username: null
+    password: null
+    rotation:
+      enabled: false
+      interval: 10  # Rotate proxy every N requests
+  
+  # GeoIP configuration
+  geoip:
+    enabled: true
+    database_path: data/geoip/GeoLite2-City.mmdb
+    default_country: US
+  
+  # Output settings
+  output_dir: Specs  # Directory for crawled data
+  memory_threshold_mb: 49152  # Memory threshold in MB
+
+# Export Configuration
+# =============================================================================
+export:
+  output_dir: exports  # Directory for exported data
+  
+  # Default format settings
+  default_format: json  # Options: csv, json, excel, html
+  default_compression: none  # Options: none, gzip, zip
+  
+  # Format-specific settings
+  formats:
+    csv:
+      delimiter: ","
+      quotechar: "\""
+      encoding: utf-8
+      include_headers: true
+    
+    json:
+      pretty_print: true
+      indent: 2
+      ensure_ascii: false
+    
+    excel:
+      sheet_name: "Crawl Data"
+      include_headers: true
+      auto_filter: true
+    
+    html:
+      template: templates/export_template.html
+      include_css: true
+      include_sorting: true
+  
+  # Batch export settings
+  batch:
+    enabled: true
+    size: 1000  # Records per batch
+    max_file_size_mb: 100  # Maximum file size before splitting
+
+# Webhook Configuration
+# =============================================================================
+webhook:
+  enabled: true
+  queue_path: data/webhook_events.db
+  
+  # Retry settings
+  retry:
+    count: 3  # Number of retries
+    delay: 5.0  # Delay between retries in seconds
+    backoff_factor: 2.0  # Exponential backoff factor
+  
+  # Request settings
+  request:
+    timeout: 10.0  # Request timeout in seconds
+    connect_timeout: 5.0  # Connection timeout in seconds
+  
+  # Batch settings
+  batch:
+    enabled: false
+    size: 10  # Events per batch
+    interval: 60.0  # Batch interval in seconds
+  
+  # Circuit breaker settings
+  circuit_breaker:
+    enabled: true
+    failure_threshold: 5  # Failures before opening circuit
+    reset_timeout: 60.0  # Seconds before trying again
+
+# Rate Limiter Configuration
+# =============================================================================
+rate_limiter:
+  enabled: true
+  
+  # Default settings (applied to all domains)
+  default:
+    requests_per_minute: 10
+    max_concurrent: 2
+    delay: 1.0  # Seconds between requests
+  
+  # Adaptive settings
+  adaptive:
+    enabled: true
+    learning_rate: 0.1  # How quickly to adapt (0-1)
+    min_delay: 0.1  # Minimum delay in seconds
+    max_delay: 60.0  # Maximum delay in seconds
+    increase_factor: 2.0  # Multiply delay by this on rate limit
+    decrease_factor: 0.9  # Multiply delay by this on success
+  
+  # Domain-specific settings (overrides defaults)
+  domains:
+    "example.com":
+      requests_per_minute: 5
+      max_concurrent: 1
+      delay: 2.0
+    
+    "api.example.org":
+      requests_per_minute: 20
+      max_concurrent: 3
+      delay: 0.5
+  
+  # Response code handling
+  response_codes:
+    rate_limited:
+      - 429  # Too Many Requests
+      - 503  # Service Unavailable
+    
+    # How to handle specific response codes
+    handling:
+      "429":
+        action: backoff  # Options: backoff, retry, fail
+        backoff_factor: 2.0
+      "503":
+        action: retry
+        max_retries: 3
+
+# Logging Configuration
+# =============================================================================
+logging:
+  level: info  # Options: debug, info, warning, error, critical
+  
+  # Console logging
+  console:
+    enabled: true
+    level: info
+    format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    colored: true
+  
+  # File logging
+  file:
+    enabled: true
+    level: debug
+    path: logs/gcrawler.log
+    max_size_mb: 10
+    backup_count: 5
+    format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  
+  # Component-specific logging
+  components:
+    api_server:
+      level: info
+      file: logs/api_server.log
+    
+    crawler:
+      level: info
+      file: logs/crawler.log
+    
+    queue_manager:
+      level: info
+      file: logs/queue.log
+    
+    webhook_notifier:
+      level: info
+      file: logs/webhooks.log
+
+# Security Configuration
+# =============================================================================
+security:
+  # HTTPS settings
+  https:
+    enabled: false  # Set to true in production
+    cert_file: certs/cert.pem
+    key_file: certs/key.pem
+  
+  # Authentication
+  authentication:
+    api_key:
+      enabled: true
+      header_name: X-API-Key
+    
+    jwt:
+      enabled: false
+      secret_key: change_me_in_production
+      algorithm: HS256
+      expires_minutes: 60
+  
+  # Content security
+  content_security:
+    sanitize_html: true
+    allowed_domains:
+      - example.com
+      - api.example.org
+    
+    # Content Security Policy
+    csp:
+      enabled: true
+      policy: "default-src 'self'; script-src 'self'"
+
+# Performance Configuration
+# =============================================================================
+performance:
+  # Memory management
+  memory:
+    limit_mb: 49152  # Memory limit in MB
+    warning_threshold: 0.8  # Warning at 80% of limit
+    check_interval: 60  # Check memory every N seconds
+  
+  # Concurrency settings
+  concurrency:
+    max_workers: 4  # Maximum worker processes
+    max_threads: 10  # Maximum threads per worker
+    max_connections: 100  # Maximum concurrent connections
+  
+  # Caching
+  cache:
+    enabled: true
+    type: memory  # Options: memory, redis, file
+    ttl: 3600  # Time to live in seconds
+    max_size_mb: 1024  # Maximum cache size
+    
+    # Redis settings (if type is redis)
+    redis:
+      host: localhost
+      port: 6379
+      db: 0
+      password: null
+
+# Environment-specific configurations
+# =============================================================================
+environments:
+  # Development environment overrides
+  development:
+    api_server:
+      reload: true
+      cors:
+        allow_origins:
+          - "*"
+    
+    crawler:
+      browser:
+        max_browsers: 1
+      url_processing:
+        batch_size: 5
+    
+    logging:
+      level: debug
+      console:
+        level: debug
+    
+    security:
+      https:
+        enabled: false
+    
+    performance:
+      memory:
+        limit_mb: 4096
+  
+  # Production environment overrides
+  production:
+    api_server:
+      reload: false
+      workers: 8
+      cors:
+        allow_origins:
+          - https://example.com
+          - https://admin.example.com
+    
+    crawler:
+      browser:
+        max_browsers: 10
+      url_processing:
+        batch_size: 20
+    
+    logging:
+      level: info
+      console:
+        level: warning
+    
+    security:
+      https:
+        enabled: true
+    
+    performance:
+      memory:
+        limit_mb: 49152
+      concurrency:
+        max_workers: 8
+        max_threads: 20
+  
+  # Testing environment overrides
+  testing:
+    api_server:
+      port: 8001
+    
+    crawler:
+      browser:
+        max_browsers: 1
+      url_processing:
+        max_total_urls: 100
+    
+    logging:
+      level: debug
+    
+    database:
+      queue:
+        path: data/test_queue.db
+      results:
+        path: data/test_results.db

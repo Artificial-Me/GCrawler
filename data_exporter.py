@@ -24,6 +24,7 @@ import zipfile
 import logging
 import time
 import re
+import random
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Union, Callable, Set, Tuple, Iterator
 from datetime import datetime
@@ -32,6 +33,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum, auto
 import html as html_lib
+import tempfile
+import shutil
 
 # Optional dependencies - imported on demand
 excel_available = False
@@ -60,6 +63,21 @@ class CompressionType(Enum):
     NONE = auto()
     GZIP = auto()
     ZIP = auto()
+
+
+class ExportError(Exception):
+    """Base exception for export errors"""
+    pass
+
+
+class ValidationError(ExportError):
+    """Validation error for export data"""
+    pass
+
+
+class FormatError(ExportError):
+    """Format error for export operations"""
+    pass
 
 
 @dataclass
@@ -102,6 +120,11 @@ class ExportOptions:
     flatten_nested: bool = True
     flatten_separator: str = "_"
     max_flatten_depth: int = 5
+    
+    # Memory management
+    chunk_size: int = 1000  # Number of rows to process at once for large datasets
+    use_temp_files: bool = True  # Use temporary files for large operations
+    max_memory_mb: int = 500  # Maximum memory usage in MB
 
 
 class DataExporter:
@@ -121,7 +144,72 @@ class DataExporter:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self._executor = ThreadPoolExecutor(max_workers=8)
+        self._temp_dir = None
         logger.info(f"DataExporter initialized with output directory: {output_dir}")
+    
+    def _validate_data(self, data: Any) -> None:
+        """
+        Validate input data
+        
+        Args:
+            data: Data to validate
+            
+        Raises:
+            ValidationError: If data is invalid
+        """
+        if data is None:
+            raise ValidationError("Data cannot be None")
+        
+        if not isinstance(data, dict):
+            raise ValidationError(f"Data must be a dictionary, got {type(data).__name__}")
+    
+    def _validate_url(self, url: str) -> None:
+        """
+        Validate URL
+        
+        Args:
+            url: URL to validate
+            
+        Raises:
+            ValidationError: If URL is invalid
+        """
+        if not url:
+            raise ValidationError("URL cannot be empty")
+        
+        if not isinstance(url, str):
+            raise ValidationError(f"URL must be a string, got {type(url).__name__}")
+        
+        # Basic URL validation
+        if not url.startswith(('http://', 'https://')):
+            raise ValidationError(f"Invalid URL format: {url}")
+    
+    def _validate_filename(self, filename: str) -> str:
+        """
+        Validate and sanitize filename
+        
+        Args:
+            filename: Filename to validate
+            
+        Returns:
+            Sanitized filename
+            
+        Raises:
+            ValidationError: If filename is invalid
+        """
+        if not filename:
+            raise ValidationError("Filename cannot be empty")
+        
+        if not isinstance(filename, str):
+            raise ValidationError(f"Filename must be a string, got {type(filename).__name__}")
+        
+        # Sanitize filename
+        sanitized = re.sub(r'[^\w\-\.]', '_', filename)
+        
+        # Ensure filename is not too long
+        if len(sanitized) > 255:
+            sanitized = sanitized[:240] + '_' + str(random.randint(1000, 9999))
+        
+        return sanitized
     
     def _prepare_export_path(self, filename: str, format_ext: str, 
                             compression: CompressionType) -> Path:
@@ -136,8 +224,8 @@ class DataExporter:
         Returns:
             Path object for export file
         """
-        # Clean filename
-        clean_filename = re.sub(r'[^\w\-\.]', '_', filename)
+        # Validate and clean filename
+        clean_filename = self._validate_filename(filename)
         
         # Add format extension if not present
         if not clean_filename.endswith(format_ext):
@@ -150,6 +238,32 @@ class DataExporter:
             clean_filename += '.zip'
         
         return self.output_dir / clean_filename
+    
+    def _get_temp_dir(self) -> Path:
+        """
+        Get temporary directory for large file operations
+        
+        Returns:
+            Path to temporary directory
+        """
+        if self._temp_dir is None:
+            self._temp_dir = Path(tempfile.mkdtemp(prefix="ghostcrawler_export_"))
+        return self._temp_dir
+    
+    def _cleanup_temp_dir(self) -> None:
+        """Clean up temporary directory"""
+        if self._temp_dir and self._temp_dir.exists():
+            try:
+                shutil.rmtree(self._temp_dir)
+                self._temp_dir = None
+            except Exception as e:
+                logger.warning(f"Failed to clean up temporary directory: {e}")
+    
+    def __del__(self):
+        """Destructor to clean up resources"""
+        self._cleanup_temp_dir()
+        if hasattr(self, '_executor') and self._executor:
+            self._executor.shutdown(wait=False)
     
     def _flatten_dict(self, data: Dict[str, Any], prefix: str = "", 
                      separator: str = "_", max_depth: int = 5, 
@@ -167,12 +281,19 @@ class DataExporter:
         Returns:
             Flattened dictionary
         """
+        if not isinstance(data, dict):
+            return {prefix: str(data) if data is not None else ""}
+        
         if current_depth >= max_depth:
-            return {prefix: str(data)}
+            return {prefix: str(data) if data else ""}
         
         flattened = {}
         
         for key, value in data.items():
+            # Skip None values
+            if value is None:
+                continue
+                
             # Create new key with prefix
             new_key = f"{prefix}{separator}{key}" if prefix else key
             
@@ -195,7 +316,7 @@ class DataExporter:
                             flattened.update(nested_flat)
                 else:
                     # Regular list - join with commas
-                    flattened[new_key] = ", ".join(str(x) for x in value)
+                    flattened[new_key] = ", ".join(str(x) for x in value if x is not None)
             else:
                 # Regular value
                 flattened[new_key] = value
@@ -310,43 +431,55 @@ class DataExporter:
             
         Returns:
             Processed data ready for export
+            
+        Raises:
+            ValidationError: If data is invalid
         """
-        processed = data.copy()
-        
-        # Extract JSON-LD data if present
-        if 'jsonld' in processed and isinstance(processed['jsonld'], dict):
-            # Move car data to top level with jsonld_ prefix
-            if 'car' in processed['jsonld']:
-                car_data = processed['jsonld']['car']
-                for key, value in car_data.items():
-                    processed[f"jsonld_{key}"] = value
-        
-        # Flatten nested structures if requested
-        if options.flatten_nested:
-            processed = self._flatten_dict(
+        try:
+            self._validate_data(data)
+            self._validate_url(url)
+            
+            processed = data.copy()
+            
+            # Extract JSON-LD data if present
+            if 'jsonld' in processed and isinstance(processed['jsonld'], dict):
+                # Move car data to top level with jsonld_ prefix
+                if 'car' in processed['jsonld']:
+                    car_data = processed['jsonld']['car']
+                    for key, value in car_data.items():
+                        processed[f"jsonld_{key}"] = value
+            
+            # Flatten nested structures if requested
+            if options.flatten_nested:
+                processed = self._flatten_dict(
+                    processed, 
+                    separator=options.flatten_separator,
+                    max_depth=options.max_flatten_depth
+                )
+            
+            # Apply field mapping
+            processed = self._apply_field_mapping(processed, options.field_mapping)
+            
+            # Apply transformers
+            processed = self._apply_transformers(processed, options.transformers)
+            
+            # Add metadata if requested
+            if options.include_metadata:
+                processed = self._add_metadata(processed, url)
+            
+            # Filter fields
+            processed = self._filter_fields(
                 processed, 
-                separator=options.flatten_separator,
-                max_depth=options.max_flatten_depth
+                include=options.include_fields,
+                exclude=options.exclude_fields
             )
-        
-        # Apply field mapping
-        processed = self._apply_field_mapping(processed, options.field_mapping)
-        
-        # Apply transformers
-        processed = self._apply_transformers(processed, options.transformers)
-        
-        # Add metadata if requested
-        if options.include_metadata:
-            processed = self._add_metadata(processed, url)
-        
-        # Filter fields
-        processed = self._filter_fields(
-            processed, 
-            include=options.include_fields,
-            exclude=options.exclude_fields
-        )
-        
-        return processed
+            
+            return processed
+            
+        except Exception as e:
+            if isinstance(e, ValidationError):
+                raise
+            raise ValidationError(f"Error preparing data: {str(e)}") from e
     
     def _get_all_fields(self, data_list: List[Dict[str, Any]]) -> List[str]:
         """
@@ -376,16 +509,19 @@ class DataExporter:
             
         Returns:
             Path to exported file
+            
+        Raises:
+            ExportError: If export fails
         """
         options = options or ExportOptions()
         
-        # Prepare data
-        processed_data = self._prepare_data(data, url, options)
-        
-        # Prepare file path
-        file_path = self._prepare_export_path(filename, ".csv", options.compression)
-        
         try:
+            # Prepare data
+            processed_data = self._prepare_data(data, url, options)
+            
+            # Prepare file path
+            file_path = self._prepare_export_path(filename, ".csv", options.compression)
+            
             # Handle compression
             if options.compression == CompressionType.GZIP:
                 open_func = gzip.open
@@ -413,9 +549,12 @@ class DataExporter:
             logger.info(f"Exported data to CSV: {file_path}")
             return str(file_path)
             
+        except ValidationError as e:
+            logger.error(f"Validation error exporting to CSV: {e}")
+            raise
         except Exception as e:
             logger.error(f"Error exporting to CSV: {e}")
-            raise
+            raise ExportError(f"Failed to export to CSV: {str(e)}") from e
     
     def export_to_json(self, data: Dict[str, Any], url: str, 
                       filename: str = "export", options: Optional[ExportOptions] = None) -> str:
@@ -430,16 +569,19 @@ class DataExporter:
             
         Returns:
             Path to exported file
+            
+        Raises:
+            ExportError: If export fails
         """
         options = options or ExportOptions()
         
-        # Prepare data
-        processed_data = self._prepare_data(data, url, options)
-        
-        # Prepare file path
-        file_path = self._prepare_export_path(filename, ".json", options.compression)
-        
         try:
+            # Prepare data
+            processed_data = self._prepare_data(data, url, options)
+            
+            # Prepare file path
+            file_path = self._prepare_export_path(filename, ".json", options.compression)
+            
             # Handle compression
             if options.compression == CompressionType.GZIP:
                 open_func = gzip.open
@@ -458,9 +600,12 @@ class DataExporter:
             logger.info(f"Exported data to JSON: {file_path}")
             return str(file_path)
             
+        except ValidationError as e:
+            logger.error(f"Validation error exporting to JSON: {e}")
+            raise
         except Exception as e:
             logger.error(f"Error exporting to JSON: {e}")
-            raise
+            raise ExportError(f"Failed to export to JSON: {str(e)}") from e
     
     def export_to_excel(self, data: Dict[str, Any], url: str, 
                        filename: str = "export", options: Optional[ExportOptions] = None) -> str:
@@ -475,19 +620,32 @@ class DataExporter:
             
         Returns:
             Path to exported file
+            
+        Raises:
+            ExportError: If export fails
+            ImportError: If openpyxl is not available
         """
         if not excel_available:
             raise ImportError("openpyxl is required for Excel export. Install with: pip install openpyxl")
         
         options = options or ExportOptions()
         
-        # Prepare data
-        processed_data = self._prepare_data(data, url, options)
-        
-        # Prepare file path (compression handled differently for Excel)
-        file_path = self._prepare_export_path(filename, ".xlsx", CompressionType.NONE)
-        
         try:
+            # Prepare data
+            processed_data = self._prepare_data(data, url, options)
+            
+            # Prepare file path (compression handled differently for Excel)
+            file_path = self._prepare_export_path(filename, ".xlsx", CompressionType.NONE)
+            
+            # Use temporary file for large datasets
+            use_temp = options.use_temp_files
+            if use_temp:
+                temp_dir = self._get_temp_dir()
+                temp_file = temp_dir / f"temp_{random.randint(1000, 9999)}.xlsx"
+                working_path = temp_file
+            else:
+                working_path = file_path
+            
             # Create workbook and sheet
             wb = openpyxl.Workbook()
             ws = wb.active
@@ -505,6 +663,9 @@ class DataExporter:
             # Write data
             for col_idx, field in enumerate(headers, 1):
                 value = processed_data.get(field, "")
+                # Convert complex types to string
+                if isinstance(value, (dict, list)):
+                    value = json.dumps(value)
                 ws.cell(row=2, column=col_idx, value=value)
             
             # Auto-adjust column widths
@@ -518,7 +679,11 @@ class DataExporter:
                 self._create_excel_summary(wb, url, processed_data)
             
             # Save workbook
-            wb.save(file_path)
+            wb.save(working_path)
+            
+            # Move from temp location if needed
+            if use_temp and working_path != file_path:
+                shutil.move(str(working_path), str(file_path))
             
             # Handle compression if requested
             compressed_path = None
@@ -534,9 +699,12 @@ class DataExporter:
             logger.info(f"Exported data to Excel: {file_path}")
             return str(file_path)
             
+        except ValidationError as e:
+            logger.error(f"Validation error exporting to Excel: {e}")
+            raise
         except Exception as e:
             logger.error(f"Error exporting to Excel: {e}")
-            raise
+            raise ExportError(f"Failed to export to Excel: {str(e)}") from e
     
     def _create_excel_summary(self, workbook: 'openpyxl.Workbook', 
                              url: str, data: Dict[str, Any]) -> None:
@@ -609,23 +777,31 @@ class DataExporter:
             
         Returns:
             Path to compressed file
+            
+        Raises:
+            ExportError: If compression fails
         """
         file_path = Path(file_path)
         
-        if compression == CompressionType.GZIP:
-            compressed_path = file_path.with_suffix(file_path.suffix + '.gz')
-            with open(file_path, 'rb') as f_in:
-                with gzip.open(compressed_path, 'wb') as f_out:
-                    f_out.write(f_in.read())
-            return compressed_path
+        try:
+            if compression == CompressionType.GZIP:
+                compressed_path = file_path.with_suffix(file_path.suffix + '.gz')
+                with open(file_path, 'rb') as f_in:
+                    with gzip.open(compressed_path, 'wb') as f_out:
+                        shutil.copyfileobj(f_in, f_out)
+                return compressed_path
+                
+            elif compression == CompressionType.ZIP:
+                compressed_path = file_path.with_suffix(file_path.suffix + '.zip')
+                with zipfile.ZipFile(compressed_path, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+                    zip_file.write(file_path, arcname=file_path.name)
+                return compressed_path
+                
+            return file_path
             
-        elif compression == CompressionType.ZIP:
-            compressed_path = file_path.with_suffix(file_path.suffix + '.zip')
-            with zipfile.ZipFile(compressed_path, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-                zip_file.write(file_path, arcname=file_path.name)
-            return compressed_path
-            
-        return file_path
+        except Exception as e:
+            logger.error(f"Error compressing file {file_path}: {e}")
+            raise ExportError(f"Failed to compress file: {str(e)}") from e
     
     def export_to_html(self, data: Dict[str, Any], url: str, 
                       filename: str = "export", options: Optional[ExportOptions] = None) -> str:
@@ -640,36 +816,55 @@ class DataExporter:
             
         Returns:
             Path to exported file
+            
+        Raises:
+            ExportError: If export fails
         """
         options = options or ExportOptions()
         
-        # Prepare data
-        processed_data = self._prepare_data(data, url, options)
-        
-        # Prepare file path
-        file_path = self._prepare_export_path(filename, ".html", options.compression)
-        
         try:
+            # Prepare data
+            processed_data = self._prepare_data(data, url, options)
+            
+            # Prepare file path
+            file_path = self._prepare_export_path(filename, ".html", options.compression)
+            
+            # Use temporary file for large datasets
+            use_temp = options.use_temp_files and len(processed_data) > 100
+            if use_temp:
+                temp_dir = self._get_temp_dir()
+                temp_file = temp_dir / f"temp_{random.randint(1000, 9999)}.html"
+                working_path = temp_file
+            else:
+                working_path = file_path
+            
             # Generate HTML content
             html_content = self._generate_html_report(processed_data, url, options)
             
-            # Handle compression
-            if options.compression == CompressionType.GZIP:
-                open_func = gzip.open
-                mode = 'wt'
-            else:
-                open_func = open
-                mode = 'w'
-            
-            with open_func(file_path, mode, encoding='utf-8') as f:
+            # Write to working path
+            with open(working_path, 'w', encoding='utf-8') as f:
                 f.write(html_content)
+            
+            # Move from temp location if needed
+            if use_temp and working_path != file_path:
+                shutil.move(str(working_path), str(file_path))
+            
+            # Handle compression
+            if options.compression != CompressionType.NONE:
+                compressed_path = self._compress_file(file_path, options.compression)
+                # Remove original file
+                os.unlink(file_path)
+                file_path = compressed_path
             
             logger.info(f"Exported data to HTML: {file_path}")
             return str(file_path)
             
+        except ValidationError as e:
+            logger.error(f"Validation error exporting to HTML: {e}")
+            raise
         except Exception as e:
             logger.error(f"Error exporting to HTML: {e}")
-            raise
+            raise ExportError(f"Failed to export to HTML: {str(e)}") from e
     
     def _generate_html_report(self, data: Dict[str, Any], url: str, 
                              options: ExportOptions) -> str:
@@ -848,6 +1043,9 @@ class DataExporter:
             
         Returns:
             Dictionary mapping URLs to export file paths
+            
+        Raises:
+            ExportError: If batch export fails
         """
         options = options or ExportOptions()
         
@@ -871,48 +1069,68 @@ class DataExporter:
         
         export_method = export_methods[format_type]
         
-        # Process in batches
-        for i in range(0, len(urls), batch_size):
-            batch_urls = urls[i:i + batch_size]
-            batch_tasks = []
-            
-            for url in batch_urls:
-                # Generate filename from URL
-                parsed_url = url.split('/')
-                filename = f"export_{parsed_url[-1]}" if len(parsed_url) > 3 else f"export_{hash(url)}"
+        try:
+            # Process in batches
+            for i in range(0, len(urls), batch_size):
+                batch_urls = urls[i:i + batch_size]
+                batch_tasks = []
                 
-                # Create task for this URL
-                task = asyncio.create_task(
-                    self._export_url_safe(
-                        export_method, 
-                        data_dict[url], 
-                        url, 
-                        filename, 
-                        options
+                for url in batch_urls:
+                    # Generate filename from URL
+                    parsed_url = url.split('/')
+                    filename = f"export_{parsed_url[-1]}" if len(parsed_url) > 3 else f"export_{hash(url)}"
+                    
+                    # Create task for this URL
+                    task = asyncio.create_task(
+                        self._export_url_safe(
+                            export_method, 
+                            data_dict[url], 
+                            url, 
+                            filename, 
+                            options
+                        )
                     )
-                )
-                batch_tasks.append((url, task))
+                    batch_tasks.append((url, task))
+                
+                # Wait for batch to complete
+                for url, task in batch_tasks:
+                    try:
+                        file_path = await task
+                        if file_path:
+                            results[url] = file_path
+                    except Exception as e:
+                        logger.error(f"Error exporting {url}: {e}")
+                
+                # Progress update
+                logger.info(f"Batch export progress: {len(results)}/{len(urls)} completed")
             
-            # Wait for batch to complete
-            for url, task in batch_tasks:
-                try:
-                    file_path = await task
-                    if file_path:
-                        results[url] = file_path
-                except Exception as e:
-                    logger.error(f"Error exporting {url}: {e}")
+            # Restore original output directory if changed
+            if output_dir:
+                self.output_dir = original_output_dir
             
-            # Progress update
-            logger.info(f"Batch export progress: {len(results)}/{len(urls)} completed")
-        
-        # Restore original output directory if changed
-        if output_dir:
-            self.output_dir = original_output_dir
-        
-        return results
+            return results
+            
+        except Exception as e:
+            logger.error(f"Error in batch export: {e}")
+            # Restore original output directory if changed
+            if output_dir:
+                self.output_dir = original_output_dir
+            raise ExportError(f"Failed to complete batch export: {str(e)}") from e
     
     async def _export_url_safe(self, export_func, data, url, filename, options):
-        """Wrapper to safely execute export function with error handling"""
+        """
+        Wrapper to safely execute export function with error handling
+        
+        Args:
+            export_func: Export function to call
+            data: Data to export
+            url: Source URL
+            filename: Output filename
+            options: Export options
+            
+        Returns:
+            Path to exported file or None if export failed
+        """
         try:
             return export_func(data, url, filename, options)
         except Exception as e:
@@ -933,45 +1151,82 @@ class DataExporter:
             
         Returns:
             Path to export file
+            
+        Raises:
+            ExportError: If export fails
+            ValueError: If format is not supported
         """
         options = options or ExportOptions()
         
-        if format_type == ExportFormat.CSV:
-            return self._create_combined_csv(data_dict, filename, options)
-        elif format_type == ExportFormat.JSON:
-            return self._create_combined_json(data_dict, filename, options)
-        elif format_type == ExportFormat.EXCEL:
-            return self._create_combined_excel(data_dict, filename, options)
-        elif format_type == ExportFormat.HTML:
-            return self._create_combined_html(data_dict, filename, options)
-        else:
-            raise ValueError(f"Unsupported format for combined export: {format_type}")
+        try:
+            if format_type == ExportFormat.CSV:
+                return self._create_combined_csv(data_dict, filename, options)
+            elif format_type == ExportFormat.JSON:
+                return self._create_combined_json(data_dict, filename, options)
+            elif format_type == ExportFormat.EXCEL:
+                return self._create_combined_excel(data_dict, filename, options)
+            elif format_type == ExportFormat.HTML:
+                return self._create_combined_html(data_dict, filename, options)
+            else:
+                raise ValueError(f"Unsupported format for combined export: {format_type}")
+                
+        except ValidationError as e:
+            logger.error(f"Validation error in combined export: {e}")
+            raise
+        except ValueError as e:
+            logger.error(f"Value error in combined export: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Error in combined export: {e}")
+            raise ExportError(f"Failed to create combined export: {str(e)}") from e
     
     def _create_combined_csv(self, data_dict: Dict[str, Dict[str, Any]], 
                             filename: str, options: ExportOptions) -> str:
-        """Create combined CSV export"""
+        """
+        Create combined CSV export
+        
+        Args:
+            data_dict: Dictionary mapping URLs to data dictionaries
+            filename: Output filename
+            options: Export options
+            
+        Returns:
+            Path to exported file
+            
+        Raises:
+            ExportError: If export fails
+        """
         # Prepare file path
         file_path = self._prepare_export_path(filename, ".csv", options.compression)
         
         try:
+            # Use temporary file for large datasets
+            use_temp = options.use_temp_files and len(data_dict) > 10
+            if use_temp:
+                temp_dir = self._get_temp_dir()
+                temp_file = temp_dir / f"temp_{random.randint(1000, 9999)}.csv"
+                working_path = temp_file
+            else:
+                working_path = file_path
+            
             # Process all data items
             processed_items = []
             for url, data in data_dict.items():
                 processed = self._prepare_data(data, url, options)
+                # Add URL as a field
+                processed['source_url'] = url
                 processed_items.append(processed)
             
             # Get all unique fields
             all_fields = self._get_all_fields(processed_items)
             
-            # Handle compression
-            if options.compression == CompressionType.GZIP:
-                open_func = gzip.open
-                mode = 'wt'
-            else:
-                open_func = open
-                mode = 'w'
+            # Ensure source_url is first column
+            if 'source_url' in all_fields:
+                all_fields.remove('source_url')
+                all_fields.insert(0, 'source_url')
             
-            with open_func(file_path, mode, newline='', encoding='utf-8') as f:
+            # Write to CSV
+            with open(working_path, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.DictWriter(
                     f, 
                     fieldnames=all_fields,
@@ -985,52 +1240,110 @@ class DataExporter:
                 for item in processed_items:
                     writer.writerow(item)
             
+            # Move from temp location if needed
+            if use_temp and working_path != file_path:
+                shutil.move(str(working_path), str(file_path))
+            
+            # Handle compression
+            if options.compression != CompressionType.NONE:
+                compressed_path = self._compress_file(file_path, options.compression)
+                # Remove original file
+                os.unlink(file_path)
+                file_path = compressed_path
+            
             logger.info(f"Exported combined data to CSV: {file_path}")
             return str(file_path)
             
         except Exception as e:
             logger.error(f"Error creating combined CSV export: {e}")
-            raise
+            raise ExportError(f"Failed to create combined CSV export: {str(e)}") from e
     
     def _create_combined_json(self, data_dict: Dict[str, Dict[str, Any]], 
                              filename: str, options: ExportOptions) -> str:
-        """Create combined JSON export"""
+        """
+        Create combined JSON export
+        
+        Args:
+            data_dict: Dictionary mapping URLs to data dictionaries
+            filename: Output filename
+            options: Export options
+            
+        Returns:
+            Path to exported file
+            
+        Raises:
+            ExportError: If export fails
+        """
         # Prepare file path
         file_path = self._prepare_export_path(filename, ".json", options.compression)
         
         try:
+            # Use temporary file for large datasets
+            use_temp = options.use_temp_files and len(data_dict) > 10
+            if use_temp:
+                temp_dir = self._get_temp_dir()
+                temp_file = temp_dir / f"temp_{random.randint(1000, 9999)}.json"
+                working_path = temp_file
+            else:
+                working_path = file_path
+            
             # Process all data items
-            combined_data = {}
+            combined_data = {
+                "metadata": {
+                    "export_timestamp": datetime.now().isoformat(),
+                    "total_items": len(data_dict)
+                },
+                "items": {}
+            }
+            
             for url, data in data_dict.items():
                 processed = self._prepare_data(data, url, options)
                 # Use URL as key in combined data
-                combined_data[url] = processed
+                combined_data["items"][url] = processed
             
-            # Handle compression
-            if options.compression == CompressionType.GZIP:
-                open_func = gzip.open
-                mode = 'wt'
-            else:
-                open_func = open
-                mode = 'w'
-            
-            with open_func(file_path, mode, encoding='utf-8') as f:
+            # Write to JSON
+            with open(working_path, 'w', encoding='utf-8') as f:
                 # Write JSON with or without pretty printing
                 if options.pretty_print:
                     json.dump(combined_data, f, indent=2, ensure_ascii=False)
                 else:
                     json.dump(combined_data, f, ensure_ascii=False)
             
+            # Move from temp location if needed
+            if use_temp and working_path != file_path:
+                shutil.move(str(working_path), str(file_path))
+            
+            # Handle compression
+            if options.compression != CompressionType.NONE:
+                compressed_path = self._compress_file(file_path, options.compression)
+                # Remove original file
+                os.unlink(file_path)
+                file_path = compressed_path
+            
             logger.info(f"Exported combined data to JSON: {file_path}")
             return str(file_path)
             
         except Exception as e:
             logger.error(f"Error creating combined JSON export: {e}")
-            raise
+            raise ExportError(f"Failed to create combined JSON export: {str(e)}") from e
     
     def _create_combined_excel(self, data_dict: Dict[str, Dict[str, Any]], 
                               filename: str, options: ExportOptions) -> str:
-        """Create combined Excel export"""
+        """
+        Create combined Excel export
+        
+        Args:
+            data_dict: Dictionary mapping URLs to data dictionaries
+            filename: Output filename
+            options: Export options
+            
+        Returns:
+            Path to exported file
+            
+        Raises:
+            ExportError: If export fails
+            ImportError: If openpyxl is not available
+        """
         if not excel_available:
             raise ImportError("openpyxl is required for Excel export. Install with: pip install openpyxl")
         
@@ -1038,6 +1351,15 @@ class DataExporter:
         file_path = self._prepare_export_path(filename, ".xlsx", CompressionType.NONE)
         
         try:
+            # Use temporary file for large datasets
+            use_temp = options.use_temp_files and len(data_dict) > 5
+            if use_temp:
+                temp_dir = self._get_temp_dir()
+                temp_file = temp_dir / f"temp_{random.randint(1000, 9999)}.xlsx"
+                working_path = temp_file
+            else:
+                working_path = file_path
+            
             # Create workbook
             wb = openpyxl.Workbook()
             
@@ -1091,7 +1413,11 @@ class DataExporter:
                     summary_sheet.column_dimensions[get_column_letter(col)].width = 15
             
             # Save workbook
-            wb.save(file_path)
+            wb.save(working_path)
+            
+            # Move from temp location if needed
+            if use_temp and working_path != file_path:
+                shutil.move(str(working_path), str(file_path))
             
             # Handle compression if requested
             if options.compression != CompressionType.NONE:
@@ -1108,11 +1434,20 @@ class DataExporter:
             
         except Exception as e:
             logger.error(f"Error creating combined Excel export: {e}")
-            raise
+            raise ExportError(f"Failed to create combined Excel export: {str(e)}") from e
     
     def _add_data_sheet(self, workbook: 'openpyxl.Workbook', sheet_name: str, 
                        data: Dict[str, Any], url: str, options: ExportOptions) -> None:
-        """Add a data sheet to Excel workbook for a single URL"""
+        """
+        Add a data sheet to Excel workbook for a single URL
+        
+        Args:
+            workbook: Excel workbook
+            sheet_name: Sheet name
+            data: Data dictionary
+            url: Source URL
+            options: Export options
+        """
         # Process data
         processed_data = self._prepare_data(data, url, options)
         
@@ -1157,11 +1492,33 @@ class DataExporter:
     
     def _create_combined_html(self, data_dict: Dict[str, Dict[str, Any]], 
                              filename: str, options: ExportOptions) -> str:
-        """Create combined HTML export"""
+        """
+        Create combined HTML export
+        
+        Args:
+            data_dict: Dictionary mapping URLs to data dictionaries
+            filename: Output filename
+            options: Export options
+            
+        Returns:
+            Path to exported file
+            
+        Raises:
+            ExportError: If export fails
+        """
         # Prepare file path
         file_path = self._prepare_export_path(filename, ".html", options.compression)
         
         try:
+            # Use temporary file for large datasets
+            use_temp = options.use_temp_files and len(data_dict) > 5
+            if use_temp:
+                temp_dir = self._get_temp_dir()
+                temp_file = temp_dir / f"temp_{random.randint(1000, 9999)}.html"
+                working_path = temp_file
+            else:
+                working_path = file_path
+            
             # Define CSS styles
             css = """
             body {
@@ -1229,6 +1586,25 @@ class DataExporter:
                 color: #7f8c8d;
                 font-size: 0.9em;
             }
+            .nav {
+                position: fixed;
+                top: 10px;
+                right: 10px;
+                background: #fff;
+                border: 1px solid #ddd;
+                border-radius: 5px;
+                padding: 10px;
+                box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            }
+            .nav a {
+                display: block;
+                margin: 5px 0;
+                color: #3498db;
+                text-decoration: none;
+            }
+            .nav a:hover {
+                text-decoration: underline;
+            }
             """
             
             # Start building HTML
@@ -1249,7 +1625,14 @@ class DataExporter:
                     <p><strong>Total URLs:</strong> {len(data_dict)}</p>
                 </div>
                 
-                <h2>URL Index</h2>
+                <div class="nav">
+                    <a href="#top">Top</a>
+                    <a href="#index">Index</a>
+                    {chr(10).join(f'<a href="#url_{i+1}">URL {i+1}</a>' for i in range(min(10, len(data_dict))))}
+                    {f'<a href="#url_{len(data_dict)}">Last URL</a>' if len(data_dict) > 10 else ''}
+                </div>
+                
+                <h2 id="index">URL Index</h2>
                 <table class="index-table">
                     <tr>
                         <th>#</th>
@@ -1340,7 +1723,10 @@ class DataExporter:
                     
                     html += "</table>"
                 
-                html += "</div>"
+                html += """
+                <p><a href="#index">Back to Index</a></p>
+                </div>
+                """
             
             # Close HTML
             html += """
@@ -1348,23 +1734,27 @@ class DataExporter:
             </html>
             """
             
-            # Handle compression
-            if options.compression == CompressionType.GZIP:
-                open_func = gzip.open
-                mode = 'wt'
-            else:
-                open_func = open
-                mode = 'w'
-            
-            with open_func(file_path, mode, encoding='utf-8') as f:
+            # Write to file
+            with open(working_path, 'w', encoding='utf-8') as f:
                 f.write(html)
+            
+            # Move from temp location if needed
+            if use_temp and working_path != file_path:
+                shutil.move(str(working_path), str(file_path))
+            
+            # Handle compression
+            if options.compression != CompressionType.NONE:
+                compressed_path = self._compress_file(file_path, options.compression)
+                # Remove original file
+                os.unlink(file_path)
+                file_path = compressed_path
             
             logger.info(f"Exported combined data to HTML: {file_path}")
             return str(file_path)
             
         except Exception as e:
             logger.error(f"Error creating combined HTML export: {e}")
-            raise
+            raise ExportError(f"Failed to create combined HTML export: {str(e)}") from e
 
 
 # Common data transformers

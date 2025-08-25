@@ -20,18 +20,20 @@ import hmac
 import hashlib
 import base64
 import uuid
+import random
+import re
+import os
+import gzip
+import traceback
+import threading
+import sqlite3
 from enum import Enum, auto
 from typing import Dict, List, Any, Optional, Set, Union, Callable, Tuple
 from dataclasses import dataclass, field
-from datetime import datetime
-import sqlite3
+from datetime import datetime, timedelta
 from pathlib import Path
-import os
-import re
-import gzip
-import traceback
 from collections import defaultdict, deque
-import threading
+from urllib.parse import urlparse, urljoin
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +67,34 @@ class CircuitState(Enum):
     HALF_OPEN = auto()  # Testing if endpoint recovered
 
 
+class WebhookError(Exception):
+    """Base exception for webhook errors"""
+    pass
+
+
+class ValidationError(WebhookError):
+    """Validation error for webhook configuration"""
+    pass
+
+
+class AuthenticationError(WebhookError):
+    """Authentication error for webhook requests"""
+    pass
+
+
+class CircuitBreakerError(WebhookError):
+    """Circuit breaker error for webhook endpoints"""
+    pass
+
+
+@dataclass
+class CircuitBreakerConfig:
+    """Configuration for circuit breaker"""
+    failure_threshold: int = 5
+    recovery_time: float = 60.0
+    half_open_max_requests: int = 1
+
+
 @dataclass
 class WebhookEndpointConfig:
     """Configuration for a webhook endpoint"""
@@ -81,9 +111,13 @@ class WebhookEndpointConfig:
     filter_expression: Optional[str] = None
     batch_size: int = 1  # 1 means no batching
     batch_interval: float = 0.0  # 0 means no time-based batching
+    circuit_breaker: CircuitBreakerConfig = field(default_factory=CircuitBreakerConfig)
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
     
     def __post_init__(self):
+        # Validate URL
+        self._validate_url()
+        
         # Convert event types to enum if they are strings
         event_types = []
         for event_type in self.event_types:
@@ -103,6 +137,27 @@ class WebhookEndpointConfig:
             except KeyError:
                 logger.warning(f"Invalid auth type: {self.auth_type}, defaulting to NONE")
                 self.auth_type = WebhookAuthType.NONE
+        
+        # Ensure circuit_breaker is a CircuitBreakerConfig
+        if isinstance(self.circuit_breaker, dict):
+            self.circuit_breaker = CircuitBreakerConfig(**self.circuit_breaker)
+        elif not isinstance(self.circuit_breaker, CircuitBreakerConfig):
+            self.circuit_breaker = CircuitBreakerConfig()
+    
+    def _validate_url(self) -> None:
+        """Validate webhook URL"""
+        if not self.url:
+            raise ValidationError("Webhook URL cannot be empty")
+        
+        try:
+            parsed = urlparse(self.url)
+            if not all([parsed.scheme, parsed.netloc]):
+                raise ValidationError(f"Invalid webhook URL: {self.url}")
+            
+            if parsed.scheme not in ['http', 'https']:
+                raise ValidationError(f"Webhook URL must use HTTP or HTTPS scheme: {self.url}")
+        except Exception as e:
+            raise ValidationError(f"Error validating webhook URL: {e}")
 
 
 @dataclass
@@ -131,15 +186,19 @@ class WebhookEvent:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'WebhookEvent':
         """Create event from dictionary"""
-        return cls(
-            id=data.get("id", str(uuid.uuid4())),
-            event_type=WebhookEventType(data["event_type"]),
-            payload=data["payload"],
-            timestamp=data.get("timestamp", time.time()),
-            endpoint_ids=data.get("endpoint_ids", []),
-            retry_count=data.get("retry_count", 0),
-            next_retry=data.get("next_retry", 0.0)
-        )
+        try:
+            return cls(
+                id=data.get("id", str(uuid.uuid4())),
+                event_type=WebhookEventType(data["event_type"]),
+                payload=data["payload"],
+                timestamp=data.get("timestamp", time.time()),
+                endpoint_ids=data.get("endpoint_ids", []),
+                retry_count=data.get("retry_count", 0),
+                next_retry=data.get("next_retry", 0.0)
+            )
+        except Exception as e:
+            logger.error(f"Error creating WebhookEvent from dict: {e}")
+            raise ValueError(f"Invalid webhook event data: {e}")
 
 
 @dataclass
@@ -156,6 +215,13 @@ class EndpointStats:
     circuit_open_until: float = 0.0
     avg_response_time: float = 0.0
     response_times: deque = field(default_factory=lambda: deque(maxlen=10))
+    
+    def update_response_time_stats(self) -> None:
+        """Update response time statistics"""
+        if not self.response_times:
+            return
+        
+        self.avg_response_time = sum(self.response_times) / len(self.response_times)
 
 
 class WebhookEventQueue:
@@ -283,22 +349,27 @@ class WebhookEventQueue:
             
             events = []
             for row in rows:
-                # Parse endpoint_ids from JSON
-                endpoint_ids = json.loads(row['endpoint_ids'])
-                
-                # Parse payload from JSON
-                payload = json.loads(row['payload'])
-                
-                event = WebhookEvent(
-                    id=row['id'],
-                    event_type=WebhookEventType(row['event_type']),
-                    payload=payload,
-                    timestamp=row['timestamp'],
-                    endpoint_ids=endpoint_ids,
-                    retry_count=row['retry_count'],
-                    next_retry=row['next_retry']
-                )
-                events.append(event)
+                try:
+                    # Parse endpoint_ids from JSON
+                    endpoint_ids = json.loads(row['endpoint_ids'])
+                    
+                    # Parse payload from JSON
+                    payload = json.loads(row['payload'])
+                    
+                    event = WebhookEvent(
+                        id=row['id'],
+                        event_type=WebhookEventType(row['event_type']),
+                        payload=payload,
+                        timestamp=row['timestamp'],
+                        endpoint_ids=endpoint_ids,
+                        retry_count=row['retry_count'],
+                        next_retry=row['next_retry']
+                    )
+                    events.append(event)
+                except Exception as e:
+                    logger.error(f"Error parsing event from database: {e}")
+                    # Mark invalid event as processed to avoid reprocessing
+                    await self.mark_event_processed(row['id'])
             
             return events
         except sqlite3.Error as e:
@@ -405,6 +476,260 @@ class WebhookEventQueue:
             finally:
                 if conn:
                     conn.close()
+    
+    async def get_queue_stats(self) -> Dict[str, Any]:
+        """
+        Get queue statistics
+        
+        Returns:
+            Dictionary with queue statistics
+        """
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            
+            # Total events
+            cursor.execute('SELECT COUNT(*) FROM webhook_events')
+            total = cursor.fetchone()[0]
+            
+            # Pending events
+            cursor.execute('SELECT COUNT(*) FROM webhook_events WHERE status = ?', ('pending',))
+            pending = cursor.fetchone()[0]
+            
+            # Processed events
+            cursor.execute('SELECT COUNT(*) FROM webhook_events WHERE status = ?', ('processed',))
+            processed = cursor.fetchone()[0]
+            
+            # Events by type
+            cursor.execute('SELECT event_type, COUNT(*) FROM webhook_events GROUP BY event_type')
+            events_by_type = {row[0]: row[1] for row in cursor.fetchall()}
+            
+            # Oldest pending event
+            cursor.execute('''
+            SELECT MIN(timestamp) FROM webhook_events 
+            WHERE status = 'pending'
+            ''')
+            oldest_pending = cursor.fetchone()[0]
+            
+            return {
+                "total": total,
+                "pending": pending,
+                "processed": processed,
+                "events_by_type": events_by_type,
+                "oldest_pending": datetime.fromtimestamp(oldest_pending).isoformat() if oldest_pending else None
+            }
+        except sqlite3.Error as e:
+            logger.error(f"Error getting queue stats: {e}")
+            return {
+                "error": str(e),
+                "total": 0,
+                "pending": 0,
+                "processed": 0,
+                "events_by_type": {}
+            }
+        finally:
+            if conn:
+                conn.close()
+
+
+class SimpleExpressionEvaluator:
+    """
+    Safe expression evaluator for webhook filtering
+    
+    Supports basic comparison operations and logical operators
+    without using eval() for security
+    """
+    
+    def __init__(self):
+        # Define supported operators
+        self.operators = {
+            '==': lambda x, y: x == y,
+            '!=': lambda x, y: x != y,
+            '>': lambda x, y: x > y,
+            '<': lambda x, y: x < y,
+            '>=': lambda x, y: x >= y,
+            '<=': lambda x, y: x <= y,
+            'contains': lambda x, y: y in x if isinstance(x, (str, list, dict)) else False,
+            'in': lambda x, y: x in y if isinstance(y, (list, dict)) else False,
+            'startswith': lambda x, y: x.startswith(y) if isinstance(x, str) else False,
+            'endswith': lambda x, y: x.endswith(y) if isinstance(x, str) else False
+        }
+        
+        # Define logical operators
+        self.logical_operators = {
+            'and': lambda x, y: x and y,
+            'or': lambda x, y: x or y
+        }
+        
+        # Regex patterns for tokenizing
+        self.token_pattern = re.compile(
+            r'(\band\b|\bor\b|==|!=|>=|<=|>|<|\bcontains\b|\bin\b|\bstartswith\b|\bendswith\b|\(|\))'
+        )
+    
+    def evaluate(self, expression: str, data: Dict[str, Any]) -> bool:
+        """
+        Evaluate a filter expression against data
+        
+        Args:
+            expression: Filter expression (e.g., "status == 'success'" or "error_count > 5")
+            data: Data dictionary
+            
+        Returns:
+            Boolean result of expression evaluation
+        """
+        try:
+            # Tokenize the expression
+            tokens = self._tokenize(expression)
+            
+            # Replace variable references with actual values
+            tokens = self._replace_variables(tokens, data)
+            
+            # Parse and evaluate
+            result = self._parse_expression(tokens)
+            return bool(result)
+        except Exception as e:
+            logger.error(f"Error evaluating expression '{expression}': {e}")
+            return False
+    
+    def _tokenize(self, expression: str) -> List[str]:
+        """Split expression into tokens"""
+        # Replace string literals with placeholders to protect them during tokenization
+        string_literals = {}
+        placeholder_counter = 0
+        
+        def replace_string(match):
+            nonlocal placeholder_counter
+            placeholder = f"__STR_{placeholder_counter}__"
+            placeholder_counter += 1
+            string_literals[placeholder] = match.group(0)
+            return placeholder
+        
+        # Find and replace string literals (both single and double quotes)
+        expr_with_placeholders = re.sub(r"'[^']*'|\"[^\"]*\"", replace_string, expression)
+        
+        # Tokenize
+        parts = self.token_pattern.split(expr_with_placeholders)
+        tokens = [p.strip() for p in parts if p and p.strip()]
+        
+        # Restore string literals
+        for i, token in enumerate(tokens):
+            if token in string_literals:
+                # Remove quotes from string literals
+                literal = string_literals[token]
+                tokens[i] = literal[1:-1]  # Remove quotes
+        
+        return tokens
+    
+    def _replace_variables(self, tokens: List[str], data: Dict[str, Any]) -> List[Any]:
+        """Replace variable references with actual values"""
+        result = []
+        
+        for token in tokens:
+            # Skip operators and parentheses
+            if (token in self.operators or 
+                token in self.logical_operators or 
+                token in ('(', ')')):
+                result.append(token)
+                continue
+            
+            # Check if token is a string literal (already processed in tokenize)
+            if token.startswith(("'", '"')) and token.endswith(("'", '"')):
+                result.append(token[1:-1])  # Remove quotes
+                continue
+            
+            # Check if token is a number
+            try:
+                if '.' in token:
+                    result.append(float(token))
+                else:
+                    result.append(int(token))
+                continue
+            except ValueError:
+                pass
+            
+            # Check if token is a boolean
+            if token.lower() == 'true':
+                result.append(True)
+                continue
+            elif token.lower() == 'false':
+                result.append(False)
+                continue
+            
+            # Check if token is a variable reference
+            if token in data:
+                result.append(data[token])
+            else:
+                # Try nested references (e.g., "user.name")
+                parts = token.split('.')
+                value = data
+                found = True
+                
+                for part in parts:
+                    if isinstance(value, dict) and part in value:
+                        value = value[part]
+                    else:
+                        found = False
+                        break
+                
+                if found:
+                    result.append(value)
+                else:
+                    # Variable not found, use None
+                    result.append(None)
+        
+        return result
+    
+    def _parse_expression(self, tokens: List[Any]) -> Any:
+        """Parse and evaluate expression tokens"""
+        if not tokens:
+            return False
+        
+        # Simple recursive descent parser
+        def parse_or():
+            left = parse_and()
+            while tokens and tokens[0] == 'or':
+                tokens.pop(0)  # Consume 'or'
+                right = parse_and()
+                left = left or right
+            return left
+        
+        def parse_and():
+            left = parse_comparison()
+            while tokens and tokens[0] == 'and':
+                tokens.pop(0)  # Consume 'and'
+                right = parse_comparison()
+                left = left and right
+            return left
+        
+        def parse_comparison():
+            if not tokens:
+                return False
+            
+            # Handle parenthesized expressions
+            if tokens[0] == '(':
+                tokens.pop(0)  # Consume '('
+                result = parse_or()
+                if tokens and tokens[0] == ')':
+                    tokens.pop(0)  # Consume ')'
+                return result
+            
+            # Handle simple comparison
+            if len(tokens) >= 3:
+                left = tokens.pop(0)
+                op = tokens.pop(0)
+                right = tokens.pop(0)
+                
+                if op in self.operators:
+                    return self.operators[op](left, right)
+            
+            # Return single value as is (treat as boolean)
+            if tokens:
+                return bool(tokens.pop(0))
+            
+            return False
+        
+        # Start parsing from the highest precedence
+        return parse_or()
 
 
 class WebhookNotifier:
@@ -438,42 +763,68 @@ class WebhookNotifier:
         self._running = False
         self._lock = asyncio.Lock()
         self._batch_lock = asyncio.Lock()
+        self._expression_evaluator = SimpleExpressionEvaluator()
         logger.info("WebhookNotifier initialized")
     
     async def start(self) -> None:
         """Start the webhook notifier"""
         if self._running:
+            logger.debug("WebhookNotifier already running")
             return
         
         self._running = True
-        self._session = aiohttp.ClientSession()
+        
+        # Create HTTP session with TCP connector that properly handles connection pooling
+        conn = aiohttp.TCPConnector(
+            limit=100,  # Max number of connections
+            ttl_dns_cache=300,  # DNS cache TTL in seconds
+            enable_cleanup_closed=True,
+            force_close=False,
+            ssl=False  # Set to None to use default SSL context
+        )
+        
+        self._session = aiohttp.ClientSession(
+            connector=conn,
+            timeout=aiohttp.ClientTimeout(total=60),
+            raise_for_status=False
+        )
+        
         self._worker_task = asyncio.create_task(self._process_queue_worker())
         logger.info("WebhookNotifier started")
     
     async def stop(self) -> None:
         """Stop the webhook notifier"""
         if not self._running:
+            logger.debug("WebhookNotifier already stopped")
             return
         
+        logger.info("Stopping WebhookNotifier...")
         self._running = False
         
         # Cancel worker task
         if self._worker_task:
             self._worker_task.cancel()
             try:
-                await self._worker_task
-            except asyncio.CancelledError:
-                pass
+                await asyncio.wait_for(asyncio.shield(self._worker_task), timeout=5.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                logger.warning("Worker task cancellation timed out or was cancelled")
             self._worker_task = None
         
         # Cancel batch timers
-        for timer in self.batch_timers.values():
+        for timer_id, timer in list(self.batch_timers.items()):
             timer.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(timer), timeout=1.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
         self.batch_timers.clear()
         
         # Close HTTP session
         if self._session:
-            await self._session.close()
+            try:
+                await asyncio.wait_for(self._session.close(), timeout=5.0)
+            except asyncio.TimeoutError:
+                logger.warning("HTTP session close timed out")
             self._session = None
         
         logger.info("WebhookNotifier stopped")
@@ -488,9 +839,17 @@ class WebhookNotifier:
         Returns:
             Endpoint ID
         """
-        self.endpoints[config.id] = config
-        logger.info(f"Added webhook endpoint {config.id}: {config.url}")
-        return config.id
+        # Validate endpoint URL
+        try:
+            if isinstance(config, dict):
+                config = WebhookEndpointConfig(**config)
+            
+            self.endpoints[config.id] = config
+            logger.info(f"Added webhook endpoint {config.id}: {config.url}")
+            return config.id
+        except ValidationError as e:
+            logger.error(f"Failed to add webhook endpoint: {e}")
+            raise
     
     def remove_endpoint(self, endpoint_id: str) -> bool:
         """
@@ -506,6 +865,7 @@ class WebhookNotifier:
             del self.endpoints[endpoint_id]
             logger.info(f"Removed webhook endpoint {endpoint_id}")
             return True
+        logger.warning(f"Attempted to remove non-existent endpoint: {endpoint_id}")
         return False
     
     def get_endpoint(self, endpoint_id: str) -> Optional[WebhookEndpointConfig]:
@@ -530,10 +890,16 @@ class WebhookNotifier:
         Returns:
             List of endpoint configurations
         """
-        return [
-            endpoint for endpoint in self.endpoints.values()
-            if endpoint.enabled and (not endpoint.event_types or event_type in endpoint.event_types)
-        ]
+        matching_endpoints = []
+        for endpoint in self.endpoints.values():
+            if not endpoint.enabled:
+                continue
+                
+            # Check if endpoint is configured for this event type
+            if not endpoint.event_types or event_type in endpoint.event_types:
+                matching_endpoints.append(endpoint)
+        
+        return matching_endpoints
     
     async def notify(self, event_type: WebhookEventType, payload: Dict[str, Any]) -> List[str]:
         """
@@ -546,18 +912,15 @@ class WebhookNotifier:
         Returns:
             List of queued event IDs
         """
+        if not self._running:
+            logger.warning("Attempted to notify while WebhookNotifier is not running")
+            return []
+            
         # Get endpoints for this event type
         endpoints = self.get_endpoints_for_event(event_type)
         if not endpoints:
             logger.debug(f"No endpoints configured for event type {event_type.value}")
             return []
-        
-        # Create event
-        event = WebhookEvent(
-            event_type=event_type,
-            payload=payload,
-            endpoint_ids=[endpoint.id for endpoint in endpoints]
-        )
         
         # Add timestamp to payload if not present
         if "timestamp" not in payload:
@@ -570,23 +933,33 @@ class WebhookNotifier:
         # Process event for each endpoint
         event_ids = []
         for endpoint in endpoints:
-            # Apply filter if specified
-            if endpoint.filter_expression and not self._evaluate_filter(endpoint.filter_expression, payload):
-                logger.debug(f"Event filtered out for endpoint {endpoint.id} by expression: {endpoint.filter_expression}")
-                continue
-            
-            # Check if endpoint uses batching
-            if endpoint.batch_size > 1:
-                await self._add_to_batch(endpoint.id, event)
-            else:
-                # Add to queue for immediate processing
-                event_copy = WebhookEvent(
-                    event_type=event_type,
-                    payload=payload.copy(),
-                    endpoint_ids=[endpoint.id]
-                )
-                if await self.event_queue.add_event(event_copy):
-                    event_ids.append(event_copy.id)
+            try:
+                # Apply filter if specified
+                if endpoint.filter_expression:
+                    if not self._evaluate_filter(endpoint.filter_expression, payload):
+                        logger.debug(f"Event filtered out for endpoint {endpoint.id} by expression: {endpoint.filter_expression}")
+                        continue
+                
+                # Check if endpoint uses batching
+                if endpoint.batch_size > 1:
+                    # Create a copy of the event for this endpoint
+                    event = WebhookEvent(
+                        event_type=event_type,
+                        payload=payload.copy(),
+                        endpoint_ids=[endpoint.id]
+                    )
+                    await self._add_to_batch(endpoint.id, event)
+                else:
+                    # Add to queue for immediate processing
+                    event = WebhookEvent(
+                        event_type=event_type,
+                        payload=payload.copy(),
+                        endpoint_ids=[endpoint.id]
+                    )
+                    if await self.event_queue.add_event(event):
+                        event_ids.append(event.id)
+            except Exception as e:
+                logger.error(f"Error processing notification for endpoint {endpoint.id}: {e}")
         
         return event_ids
     
@@ -594,6 +967,7 @@ class WebhookNotifier:
         """Add event to batch queue for an endpoint"""
         endpoint = self.endpoints.get(endpoint_id)
         if not endpoint:
+            logger.warning(f"Attempted to add event to batch for non-existent endpoint: {endpoint_id}")
             return
         
         async with self._batch_lock:
@@ -605,7 +979,9 @@ class WebhookNotifier:
                 await self._flush_batch(endpoint_id)
             elif endpoint.batch_interval > 0 and endpoint_id not in self.batch_timers:
                 # Start timer for time-based batching
-                self.batch_timers[endpoint_id] = asyncio.create_task(self._batch_timer(endpoint_id, endpoint.batch_interval))
+                self.batch_timers[endpoint_id] = asyncio.create_task(
+                    self._batch_timer(endpoint_id, endpoint.batch_interval)
+                )
     
     async def _batch_timer(self, endpoint_id: str, interval: float) -> None:
         """Timer for flushing batches after an interval"""
@@ -615,7 +991,9 @@ class WebhookNotifier:
                 if endpoint_id in self.batch_queues and self.batch_queues[endpoint_id]:
                     await self._flush_batch(endpoint_id)
         except asyncio.CancelledError:
-            pass
+            logger.debug(f"Batch timer for endpoint {endpoint_id} cancelled")
+        except Exception as e:
+            logger.error(f"Error in batch timer for endpoint {endpoint_id}: {e}")
         finally:
             async with self._batch_lock:
                 if endpoint_id in self.batch_timers:
@@ -628,6 +1006,7 @@ class WebhookNotifier:
         
         endpoint = self.endpoints.get(endpoint_id)
         if not endpoint:
+            logger.warning(f"Attempted to flush batch for non-existent endpoint: {endpoint_id}")
             return
         
         # Create a combined event
@@ -656,7 +1035,11 @@ class WebhookNotifier:
         )
         
         # Add to queue
-        await self.event_queue.add_event(batch_event)
+        try:
+            await self.event_queue.add_event(batch_event)
+            logger.debug(f"Flushed batch of {len(events)} events for endpoint {endpoint_id}")
+        except Exception as e:
+            logger.error(f"Error adding batch event to queue: {e}")
         
         # Clear batch queue
         self.batch_queues[endpoint_id] = []
@@ -678,30 +1061,15 @@ class WebhookNotifier:
             True if the payload passes the filter, False otherwise
         """
         try:
-            # Simple expression evaluator
-            # This is a basic implementation - in production, consider using a proper expression parser
-            
-            # Replace payload fields with their values
-            expr = expression
-            for key, value in payload.items():
-                if isinstance(value, str):
-                    # Replace string values with quoted strings
-                    expr = expr.replace(f"{key}", f"'{value}'")
-                elif isinstance(value, (int, float, bool)):
-                    # Replace numeric values directly
-                    expr = expr.replace(f"{key}", str(value))
-            
-            # Evaluate the expression
-            # Note: This is a security risk if not properly sanitized
-            # In production, use a safer evaluation method
-            result = eval(expr)
-            return bool(result)
+            return self._expression_evaluator.evaluate(expression, payload)
         except Exception as e:
             logger.error(f"Error evaluating filter expression '{expression}': {e}")
             return False
     
     async def _process_queue_worker(self) -> None:
         """Worker task to process the event queue"""
+        logger.info("Webhook queue worker started")
+        
         while self._running:
             try:
                 # Get pending events
@@ -712,9 +1080,17 @@ class WebhookNotifier:
                     await asyncio.sleep(1.0)
                     continue
                 
+                logger.debug(f"Processing {len(events)} pending webhook events")
+                
                 # Process events
                 for event in events:
+                    if not self._running:
+                        break
+                        
                     for endpoint_id in event.endpoint_ids:
+                        if not self._running:
+                            break
+                            
                         endpoint = self.endpoints.get(endpoint_id)
                         if not endpoint or not endpoint.enabled:
                             continue
@@ -748,7 +1124,9 @@ class WebhookNotifier:
                             if retry_count < endpoint.retry_count:
                                 # Calculate next retry time with exponential backoff
                                 backoff = endpoint.retry_delay * (2 ** (retry_count - 1))
-                                next_retry = time.time() + backoff
+                                # Add jitter to prevent thundering herd
+                                jitter = random.uniform(0.75, 1.25)
+                                next_retry = time.time() + (backoff * jitter)
                                 
                                 await self.event_queue.update_event_retry(event.id, retry_count, next_retry)
                                 logger.debug(f"Scheduled retry #{retry_count} for event {event.id} at {datetime.fromtimestamp(next_retry).isoformat()}")
@@ -762,10 +1140,14 @@ class WebhookNotifier:
                     await self.event_queue.purge_processed_events()
                 
             except asyncio.CancelledError:
+                logger.info("Webhook queue worker cancelled")
                 break
             except Exception as e:
                 logger.error(f"Error in webhook queue worker: {e}")
+                logger.error(traceback.format_exc())
                 await asyncio.sleep(5.0)  # Sleep longer on error
+        
+        logger.info("Webhook queue worker stopped")
     
     async def _send_webhook(self, endpoint: WebhookEndpointConfig, 
                            event: WebhookEvent) -> Tuple[bool, Optional[str]]:
@@ -811,7 +1193,15 @@ class WebhookNotifier:
         
         # Add authentication
         if endpoint.auth_type != WebhookAuthType.NONE:
-            self._add_authentication(headers, payload, endpoint)
+            try:
+                self._add_authentication(headers, payload, endpoint)
+            except AuthenticationError as e:
+                logger.error(f"Authentication error for endpoint {endpoint.id}: {e}")
+                stats.failed += 1
+                stats.last_failure = time.time()
+                stats.last_error = str(e)
+                stats.consecutive_failures += 1
+                return False, str(e)
         
         start_time = time.time()
         
@@ -820,11 +1210,17 @@ class WebhookNotifier:
                 endpoint.url,
                 json=payload,
                 headers=headers,
-                timeout=endpoint.timeout
+                timeout=aiohttp.ClientTimeout(total=endpoint.timeout)
             ) as response:
                 response_time = time.time() - start_time
                 stats.response_times.append(response_time)
-                stats.avg_response_time = sum(stats.response_times) / len(stats.response_times)
+                stats.update_response_time_stats()
+                
+                # Read response body for error reporting
+                try:
+                    response_body = await response.text()
+                except Exception as e:
+                    response_body = f"<Error reading response: {e}>"
                 
                 # Check if request was successful
                 if 200 <= response.status < 300:
@@ -835,8 +1231,7 @@ class WebhookNotifier:
                     return True, None
                 else:
                     # Handle failure
-                    error_text = await response.text()
-                    error_message = f"HTTP {response.status}: {error_text[:100]}"
+                    error_message = f"HTTP {response.status}: {response_body[:200]}"
                     stats.failed += 1
                     stats.last_failure = time.time()
                     stats.last_error = error_message
@@ -862,8 +1257,21 @@ class WebhookNotifier:
             logger.warning(f"Webhook to {endpoint.url} timed out")
             return False, error_message
             
+        except aiohttp.ClientError as e:
+            error_message = f"HTTP client error: {str(e)}"
+            stats.failed += 1
+            stats.last_failure = time.time()
+            stats.last_error = error_message
+            stats.consecutive_failures += 1
+            
+            # Update circuit breaker
+            await self._update_circuit_breaker(endpoint.id)
+            
+            logger.error(f"HTTP client error sending webhook to {endpoint.url}: {e}")
+            return False, error_message
+            
         except Exception as e:
-            error_message = str(e)
+            error_message = f"Unexpected error: {str(e)}"
             stats.failed += 1
             stats.last_failure = time.time()
             stats.last_error = error_message
@@ -873,6 +1281,7 @@ class WebhookNotifier:
             await self._update_circuit_breaker(endpoint.id)
             
             logger.error(f"Error sending webhook to {endpoint.url}: {e}")
+            logger.error(traceback.format_exc())
             return False, error_message
     
     async def _update_circuit_breaker(self, endpoint_id: str) -> None:
@@ -883,57 +1292,107 @@ class WebhookNotifier:
         if not endpoint:
             return
         
-        # Default threshold
-        failure_threshold = 5
-        recovery_time = 60.0
+        # Get circuit breaker config
+        cb_config = endpoint.circuit_breaker
         
         if stats.circuit_state == CircuitState.CLOSED:
             # Check if we need to open the circuit
-            if stats.consecutive_failures >= failure_threshold:
+            if stats.consecutive_failures >= cb_config.failure_threshold:
                 # Open the circuit
                 stats.circuit_state = CircuitState.OPEN
-                stats.circuit_open_until = time.time() + recovery_time
+                stats.circuit_open_until = time.time() + cb_config.recovery_time
                 
-                logger.warning(f"Opening circuit breaker for endpoint {endpoint_id} after {stats.consecutive_failures} consecutive failures")
+                logger.warning(
+                    f"Opening circuit breaker for endpoint {endpoint_id} after "
+                    f"{stats.consecutive_failures} consecutive failures. "
+                    f"Will retry in {cb_config.recovery_time} seconds."
+                )
+                
+                # Send circuit breaker event if notifier is running
+                if self._running:
+                    await self.notify(
+                        WebhookEventType.CIRCUIT_BREAKER_TRIGGERED,
+                        {
+                            "endpoint_id": endpoint_id,
+                            "url": endpoint.url,
+                            "state": "OPEN",
+                            "consecutive_failures": stats.consecutive_failures,
+                            "last_error": stats.last_error,
+                            "recovery_time": cb_config.recovery_time,
+                            "recovery_at": datetime.fromtimestamp(stats.circuit_open_until).isoformat()
+                        }
+                    )
                 
         elif stats.circuit_state == CircuitState.HALF_OPEN:
             # Test request failed, reopen the circuit
             stats.circuit_state = CircuitState.OPEN
-            stats.circuit_open_until = time.time() + recovery_time
-            logger.warning(f"Reopening circuit breaker for endpoint {endpoint_id} after failed test")
+            stats.circuit_open_until = time.time() + cb_config.recovery_time
+            
+            logger.warning(
+                f"Reopening circuit breaker for endpoint {endpoint_id} after failed test. "
+                f"Will retry in {cb_config.recovery_time} seconds."
+            )
+            
+            # Send circuit breaker event if notifier is running
+            if self._running:
+                await self.notify(
+                    WebhookEventType.CIRCUIT_BREAKER_TRIGGERED,
+                    {
+                        "endpoint_id": endpoint_id,
+                        "url": endpoint.url,
+                        "state": "REOPENED",
+                        "consecutive_failures": stats.consecutive_failures,
+                        "last_error": stats.last_error,
+                        "recovery_time": cb_config.recovery_time,
+                        "recovery_at": datetime.fromtimestamp(stats.circuit_open_until).isoformat()
+                    }
+                )
     
     def _add_authentication(self, headers: Dict[str, str], payload: Dict[str, Any], 
                            endpoint: WebhookEndpointConfig) -> None:
-        """Add authentication to request headers"""
+        """
+        Add authentication to request headers
+        
+        Args:
+            headers: Request headers to modify
+            payload: Request payload
+            endpoint: Webhook endpoint configuration
+            
+        Raises:
+            AuthenticationError: If authentication configuration is invalid
+        """
         auth_type = endpoint.auth_type
         credentials = endpoint.auth_credentials
         
         if auth_type == WebhookAuthType.BEARER_TOKEN:
             token = credentials.get("token")
-            if token:
-                headers["Authorization"] = f"Bearer {token}"
-            else:
-                logger.warning(f"Bearer token authentication configured but no token provided for endpoint {endpoint.id}")
+            if not token:
+                raise AuthenticationError("Bearer token authentication configured but no token provided")
+            headers["Authorization"] = f"Bearer {token}"
                 
         elif auth_type == WebhookAuthType.API_KEY:
             key = credentials.get("key")
             key_name = credentials.get("key_name", "X-API-Key")
-            if key:
-                headers[key_name] = key
-            else:
-                logger.warning(f"API key authentication configured but no key provided for endpoint {endpoint.id}")
+            if not key:
+                raise AuthenticationError("API key authentication configured but no key provided")
+            headers[key_name] = key
                 
         elif auth_type == WebhookAuthType.HMAC:
             secret = credentials.get("secret")
             algorithm = credentials.get("algorithm", "sha256")
             header_name = credentials.get("header_name", "X-Signature")
             
-            if secret:
+            if not secret:
+                raise AuthenticationError("HMAC authentication configured but no secret provided")
+            
+            try:
                 # Create signature from payload
                 payload_str = json.dumps(payload, separators=(',', ':'))
                 
                 # Get appropriate hash algorithm
-                hash_func = getattr(hashlib, algorithm, hashlib.sha256)
+                hash_func = getattr(hashlib, algorithm, None)
+                if not hash_func:
+                    raise AuthenticationError(f"Unsupported hash algorithm: {algorithm}")
                 
                 # Create HMAC signature
                 signature = hmac.new(
@@ -944,19 +1403,19 @@ class WebhookNotifier:
                 
                 # Add signature to headers
                 headers[header_name] = base64.b64encode(signature).decode('ascii')
-            else:
-                logger.warning(f"HMAC authentication configured but no secret provided for endpoint {endpoint.id}")
+            except Exception as e:
+                raise AuthenticationError(f"Error creating HMAC signature: {e}")
                 
         elif auth_type == WebhookAuthType.BASIC:
             username = credentials.get("username")
             password = credentials.get("password")
             
-            if username and password:
-                auth_str = f"{username}:{password}"
-                encoded = base64.b64encode(auth_str.encode('utf-8')).decode('ascii')
-                headers["Authorization"] = f"Basic {encoded}"
-            else:
-                logger.warning(f"Basic authentication configured but credentials not provided for endpoint {endpoint.id}")
+            if not username or not password:
+                raise AuthenticationError("Basic authentication configured but credentials not provided")
+            
+            auth_str = f"{username}:{password}"
+            encoded = base64.b64encode(auth_str.encode('utf-8')).decode('ascii')
+            headers["Authorization"] = f"Basic {encoded}"
     
     def _transform_payload(self, payload: Dict[str, Any], template: str) -> Dict[str, Any]:
         """
@@ -1016,10 +1475,36 @@ class WebhookNotifier:
                 "last_failure": datetime.fromtimestamp(stats.last_failure).isoformat() if stats.last_failure > 0 else None,
                 "last_error": stats.last_error,
                 "consecutive_failures": stats.consecutive_failures,
-                "circuit_state": stats.circuit_state.name
+                "circuit_state": stats.circuit_state.name,
+                "circuit_open_until": datetime.fromtimestamp(stats.circuit_open_until).isoformat() if stats.circuit_open_until > 0 else None,
+                "batch_queue_size": len(self.batch_queues.get(endpoint_id, []))
             }
         
         return result
+    
+    async def get_full_stats(self) -> Dict[str, Any]:
+        """
+        Get comprehensive statistics including queue stats
+        
+        Returns:
+            Dictionary with complete statistics
+        """
+        endpoint_stats = self.get_stats()
+        
+        try:
+            queue_stats = await self.event_queue.get_queue_stats()
+        except Exception as e:
+            logger.error(f"Error getting queue stats: {e}")
+            queue_stats = {"error": str(e)}
+        
+        return {
+            "endpoints": endpoint_stats,
+            "queue": queue_stats,
+            "timestamp": datetime.now().isoformat(),
+            "running": self._running,
+            "total_endpoints": len(self.endpoints),
+            "enabled_endpoints": sum(1 for ep in self.endpoints.values() if ep.enabled)
+        }
     
     def load_endpoints_from_file(self, file_path: str) -> int:
         """
@@ -1036,10 +1521,18 @@ class WebhookNotifier:
                 data = json.load(f)
             
             count = 0
+            errors = []
+            
             for endpoint_data in data.get("endpoints", []):
-                config = WebhookEndpointConfig(**endpoint_data)
-                self.add_endpoint(config)
-                count += 1
+                try:
+                    config = WebhookEndpointConfig(**endpoint_data)
+                    self.add_endpoint(config)
+                    count += 1
+                except Exception as e:
+                    errors.append(f"Error adding endpoint {endpoint_data.get('id', 'unknown')}: {e}")
+            
+            if errors:
+                logger.warning(f"Errors loading some endpoints: {'; '.join(errors)}")
             
             logger.info(f"Loaded {count} webhook endpoints from {file_path}")
             return count
@@ -1074,11 +1567,19 @@ class WebhookNotifier:
                         "transform_template": endpoint.transform_template,
                         "filter_expression": endpoint.filter_expression,
                         "batch_size": endpoint.batch_size,
-                        "batch_interval": endpoint.batch_interval
+                        "batch_interval": endpoint.batch_interval,
+                        "circuit_breaker": {
+                            "failure_threshold": endpoint.circuit_breaker.failure_threshold,
+                            "recovery_time": endpoint.circuit_breaker.recovery_time,
+                            "half_open_max_requests": endpoint.circuit_breaker.half_open_max_requests
+                        }
                     }
                     for endpoint in self.endpoints.values()
                 ]
             }
+            
+            # Ensure directory exists
+            os.makedirs(os.path.dirname(os.path.abspath(file_path)), exist_ok=True)
             
             with open(file_path, 'w') as f:
                 json.dump(data, f, indent=2)
@@ -1088,6 +1589,21 @@ class WebhookNotifier:
         except Exception as e:
             logger.error(f"Error saving webhook endpoints to {file_path}: {e}")
             return False
+    
+    async def flush_all_batches(self) -> int:
+        """
+        Flush all batch queues
+        
+        Returns:
+            Number of batches flushed
+        """
+        count = 0
+        async with self._batch_lock:
+            for endpoint_id in list(self.batch_queues.keys()):
+                if self.batch_queues[endpoint_id]:
+                    await self._flush_batch(endpoint_id)
+                    count += 1
+        return count
 
 
 # Helper functions for creating common event payloads
@@ -1191,4 +1707,15 @@ def create_progress_update_payload(total_urls: int, processed: int,
         "eta_seconds": eta,
         "eta_time": (datetime.now() + timedelta(seconds=eta)).isoformat() if eta > 0 else None,
         "urls_per_second": processed / elapsed_time if elapsed_time > 0 else 0
+    }
+
+def create_memory_warning_payload(memory_usage_percent: float, memory_usage_mb: float,
+                                 threshold_mb: float) -> Dict[str, Any]:
+    """Create payload for MEMORY_WARNING event"""
+    return {
+        "timestamp": datetime.now().isoformat(),
+        "memory_usage_percent": memory_usage_percent,
+        "memory_usage_mb": memory_usage_mb,
+        "threshold_mb": threshold_mb,
+        "available_mb": threshold_mb - memory_usage_mb if threshold_mb > memory_usage_mb else 0
     }
