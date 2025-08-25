@@ -1,0 +1,177 @@
+{
+  "version": "1.0.0",
+  "application": {
+    "name": "GhostCrawler",
+    "log_level": "INFO",
+    "log_file": "ghostcrawler.log",
+    "data_dir": "./data",
+    "temp_dir": "./temp"
+  },
+  "crawler": {
+    "max_browsers": 2,
+    "headless": true,
+    "batch_size": 10,
+    "url_delay": 1.0,
+    "max_retries": 3,
+    "timeout": 30,
+    "output_dir": "Specs",
+    "max_depth": 3,
+    "follow_external_links": false,
+    "respect_robots_txt": true,
+    "user_agent": "GhostCrawler/1.0",
+    "humanize": true,
+    "geoip": true,
+    "block_resources": [
+      "stylesheet",
+      "image",
+      "media",
+      "font",
+      "other"
+    ],
+    "proxy": {
+      "enabled": false,
+      "server": null,
+      "username": null,
+      "password": null,
+      "rotation_policy": "round_robin"
+    }
+  },
+  "queue_manager": {
+    "db_path": "queue.db",
+    "max_retries": 3,
+    "retry_delay": 60,
+    "max_priority_boost": 5,
+    "cleanup_interval": 3600,
+    "max_in_memory_tasks": 1000,
+    "persistent": true,
+    "checkpoint_interval": 300,
+    "max_batch_size": 100,
+    "purge_completed_after": 86400,
+    "purge_failed_after": 604800
+  },
+  "data_exporter": {
+    "output_dir": "exports",
+    "default_format": "json",
+    "compression": "none",
+    "pretty_print": true,
+    "include_metadata": true,
+    "max_file_size_mb": 100,
+    "split_large_exports": true,
+    "export_formats": {
+      "json": {
+        "enabled": true,
+        "indent": 2,
+        "ensure_ascii": false
+      },
+      "csv": {
+        "enabled": true,
+        "delimiter": ",",
+        "quotechar": "\"",
+        "include_headers": true
+      },
+      "excel": {
+        "enabled": true,
+        "sheet_name": "GhostCrawler Data",
+        "freeze_panes": true
+      },
+      "html": {
+        "enabled": true,
+        "template": "default",
+        "include_css": true,
+        "include_sorting": true
+      }
+    }
+  },
+  "webhook_notifier": {
+    "queue_path": "webhook_events.db",
+    "enabled": true,
+    "max_concurrent_requests": 10,
+    "default_retry_count": 3,
+    "default_retry_delay": 5.0,
+    "default_timeout": 10.0,
+    "purge_processed_after_hours": 24,
+    "endpoints": [
+      {
+        "url": "https://example.com/webhook",
+        "event_types": ["crawl_started", "crawl_completed", "error_threshold"],
+        "auth_type": "none",
+        "auth_credentials": {},
+        "enabled": false,
+        "description": "Example webhook endpoint (disabled by default)"
+      }
+    ],
+    "circuit_breaker": {
+      "failure_threshold": 5,
+      "recovery_time": 60.0,
+      "half_open_max_requests": 1
+    }
+  },
+  "rate_limiter": {
+    "enabled": true,
+    "default_config": {
+      "min_delay": 1.0,
+      "max_delay": 60.0,
+      "target_response_time": 0.8,
+      "backoff_factor": 1.5,
+      "recovery_factor": 0.9,
+      "max_consecutive_errors": 5,
+      "circuit_recovery_time": 30.0,
+      "response_time_weight": 0.3,
+      "status_code_weight": 0.5,
+      "error_weight": 0.7,
+      "window_size": 10,
+      "respect_retry_after": true,
+      "respect_rate_limit_headers": true
+    },
+    "domain_configs": {
+      "example.com": {
+        "min_delay": 2.0,
+        "max_delay": 30.0,
+        "description": "Example domain-specific configuration"
+      }
+    },
+    "optimization": {
+      "auto_optimize": true,
+      "min_requests_before_optimize": 10,
+      "max_age_hours": 24,
+      "optimization_interval": 3600
+    }
+  },
+  "api_server": {
+    "enabled": true,
+    "host": "0.0.0.0",
+    "port": 8000,
+    "reload": false,
+    "debug": false,
+    "workers": 4,
+    "cors": {
+      "allow_origins": ["*"],
+      "allow_methods": ["*"],
+      "allow_headers": ["*"]
+    },
+    "rate_limit": {
+      "enabled": true,
+      "window": 60,
+      "max_requests": 100
+    },
+    "api_keys": [
+      "your-api-key-here"
+    ],
+    "docs_url": "/docs",
+    "redoc_url": "/redoc"
+  },
+  "system": {
+    "memory_threshold_mb": 49152,
+    "cpu_threshold_percent": 90,
+    "disk_threshold_percent": 90,
+    "max_total_urls": 1000000,
+    "max_concurrent_tasks": 100,
+    "shutdown_timeout": 30,
+    "monitoring_interval": 60,
+    "alert_thresholds": {
+      "error_rate": 0.2,
+      "memory_usage": 0.8,
+      "crawl_speed_min": 1.0
+    }
+  }
+}

@@ -1,0 +1,94 @@
+version: '3.8'
+
+services:
+  ghostcrawler:
+    image: python:3.10-slim
+    container_name: ghostcrawler
+    working_dir: /app
+    command: >
+      bash -c "
+        pip install -r requirements.txt &&
+        python api_server.py
+      "
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./:/app
+      - data-volume:/app/data
+      - exports-volume:/app/exports
+      - logs-volume:/app/logs
+      - config-volume:/app/config
+    environment:
+      - NODE_ENV=production
+      - DEBUG=false
+      - API_HOST=0.0.0.0
+      - API_PORT=8000
+      - API_WORKERS=4
+      - API_RELOAD=false
+      - QUEUE_DB_PATH=/app/data/queue.db
+      - WEBHOOK_DB_PATH=/app/data/webhook_events.db
+      - RATE_LIMITER_DB_PATH=/app/data/rate_limiter.db
+      - CONFIG_FILE_PATH=/app/config/config.json
+      - LOG_LEVEL=INFO
+      - LOG_FILE=/app/logs/ghostcrawler.log
+      - MEMORY_THRESHOLD_MB=4096
+      - MAX_BROWSERS=2
+      - HEADLESS=true
+    env_file:
+      - .env
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+        reservations:
+          cpus: '0.5'
+          memory: 1G
+    networks:
+      - ghostcrawler-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Uncomment to add a browser service for non-headless mode
+  # browser:
+  #   image: browserless/chrome:latest
+  #   container_name: ghostcrawler-browser
+  #   ports:
+  #     - "3000:3000"
+  #   environment:
+  #     - MAX_CONCURRENT_SESSIONS=10
+  #     - CONNECTION_TIMEOUT=300000
+  #     - MAX_QUEUE_LENGTH=100
+  #     - PREBOOT_CHROME=true
+  #   restart: unless-stopped
+  #   networks:
+  #     - ghostcrawler-network
+  #   deploy:
+  #     resources:
+  #       limits:
+  #         cpus: '2'
+  #         memory: 4G
+
+volumes:
+  data-volume:
+    driver: local
+  exports-volume:
+    driver: local
+  logs-volume:
+    driver: local
+  config-volume:
+    driver: local
+
+networks:
+  ghostcrawler-network:
+    driver: bridge
