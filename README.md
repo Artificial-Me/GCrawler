@@ -15,7 +15,7 @@ A high-performance, stealth web crawler and scraper with advanced anti-detection
 - **GUI Dashboard**: Modern ttkbootstrap-based interface for easy configuration and monitoring
 - **Progress Tracking**: Real-time statistics on crawl progress, success rates, and speed
 
-![GhostCrawler GUI Dashboard](public/gui_v1.png)
+![GhostCrawler GUI Dashboard](public/gui-v2.png)
 
 
 ### Setup
