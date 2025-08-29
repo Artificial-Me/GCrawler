@@ -49,32 +49,41 @@ class URLProcessor:
     
     def scan_existing_files(self) -> Dict[str, str]:
         """Scan output directory for existing files"""
-        print(f"\n📂 SCANNING EXISTING OUTPUT FILES")
-        print(f"   └─ Directory: {self.output_dir}")
+        print(f"\n[SCAN] SCANNING EXISTING OUTPUT FILES")
+        print(f"   -> Directory: {self.output_dir}")
         
         existing_files = {}
         file_count = 0
         
         if not self.output_dir.exists():
-            print(f"   ⚠️ Output directory doesn't exist yet")
+            print(f"   [WARN] Output directory doesn't exist yet")
             return existing_files
         
         # Scan all manufacturer directories
         for manufacturer_dir in self.output_dir.iterdir():
             if manufacturer_dir.is_dir():
-                # Look for RAW_HTML subdirectory
+                # Look for RAW_HTML subdirectory (legacy structure)
                 raw_html_dir = manufacturer_dir / f"{manufacturer_dir.name.upper()}_RAW_HTML"
                 if raw_html_dir.exists():
-                    # Scan all HTML files
+                    # Scan all HTML files in RAW_HTML subdirectory
                     for file_path in raw_html_dir.glob("*.html"):
                         file_count += 1
                         # Store by filename for quick lookup
                         existing_files[file_path.name] = str(file_path)
                         
                         if file_count % 1000 == 0:
-                            print(f"      └─ Scanned {file_count} files...")
+                            print(f"      -> Scanned {file_count} files...")
+                else:
+                    # Scan HTML files directly in manufacturer directory (current structure)
+                    for file_path in manufacturer_dir.glob("*.html"):
+                        file_count += 1
+                        # Store by filename for quick lookup
+                        existing_files[file_path.name] = str(file_path)
+                        
+                        if file_count % 1000 == 0:
+                            print(f"      -> Scanned {file_count} files...")
         
-        print(f"   ✅ Found {file_count} existing files")
+        print(f"   [OK] Found {file_count} existing files")
         self.stats['files_found'] = file_count
         return existing_files
     
@@ -96,14 +105,14 @@ class URLProcessor:
     
     def filter_unprocessed_urls(self, urls: List[str], force_recrawl: bool = False) -> List[str]:
         """Filter out already processed URLs"""
-        print(f"\n🔍 FILTERING URLS")
-        print(f"   ├─ Total input URLs: {len(urls)}")
-        print(f"   └─ Force recrawl: {force_recrawl}")
+        print(f"\n[FILTER] FILTERING URLS")
+        print(f"   - Total input URLs: {len(urls)}")
+        print(f"   -> Force recrawl: {force_recrawl}")
         
         self.stats['total_input'] = len(urls)
         
         if force_recrawl:
-            print(f"   ⚠️ Force recrawl enabled - processing all URLs")
+            print(f"   [WARN] Force recrawl enabled - processing all URLs")
             self.stats['to_process'] = len(urls)
             return urls
         
@@ -111,7 +120,7 @@ class URLProcessor:
         existing_files = self.scan_existing_files()
         
         # Filter URLs
-        print(f"\n⏳ Checking which URLs need processing...")
+        print(f"\n[CHECK] Checking which URLs need processing...")
         unprocessed_urls = []
         processed_count = 0
         
@@ -124,19 +133,19 @@ class URLProcessor:
             
             # Progress update
             if (i + 1) % 1000 == 0:
-                print(f"   └─ Checked {i + 1}/{len(urls)} URLs...")
+                print(f"   -> Checked {i + 1}/{len(urls)} URLs...")
         
         self.stats['already_processed'] = processed_count
         self.stats['to_process'] = len(unprocessed_urls)
         
         # Print summary
-        print(f"\n📊 FILTERING COMPLETE")
-        print(f"   ├─ Already processed: {processed_count} ({processed_count/len(urls)*100:.1f}%)")
-        print(f"   ├─ Need processing: {len(unprocessed_urls)} ({len(unprocessed_urls)/len(urls)*100:.1f}%)")
-        print(f"   └─ Existing files: {self.stats['files_found']}")
+        print(f"\n[COMPLETE] FILTERING COMPLETE")
+        print(f"   - Already processed: {processed_count} ({processed_count/len(urls)*100:.1f}%)")
+        print(f"   - Need processing: {len(unprocessed_urls)} ({len(unprocessed_urls)/len(urls)*100:.1f}%)")
+        print(f"   -> Existing files: {self.stats['files_found']}")
         
         if processed_count > 0:
-            print(f"\n✅ Skipping {processed_count} already completed URLs")
+            print(f"\n[SKIP] Skipping {processed_count} already completed URLs")
         
         return unprocessed_urls
     
@@ -144,7 +153,7 @@ class URLProcessor:
         """Get a formatted progress report"""
         report = []
         report.append("\n" + "="*60)
-        report.append("📈 URL PROCESSING REPORT")
+        report.append("URL PROCESSING REPORT")
         report.append("="*60)
         report.append(f"Total Input URLs:      {self.stats['total_input']:,}")
         report.append(f"Already Processed:     {self.stats['already_processed']:,}")
@@ -170,7 +179,7 @@ class URLProcessor:
         with open(output_file, 'w') as f:
             json.dump(progress_data, f, indent=2)
         
-        print(f"   💾 Progress saved to {output_file}")
+        print(f"   [SAVE] Progress saved to {output_file}")
     
     def load_progress(self, progress_file: str = "crawl_progress.json") -> bool:
         """Load previous progress if available"""
@@ -181,11 +190,11 @@ class URLProcessor:
             with open(progress_file, 'r') as f:
                 data = json.load(f)
                 
-            print(f"\n📥 Loaded previous progress from {data['timestamp']}")
-            print(f"   └─ Previously processed: {data['total_processed']} URLs")
+            print(f"\n[LOAD] Loaded previous progress from {data['timestamp']}")
+            print(f"   -> Previously processed: {data['total_processed']} URLs")
             return True
         except Exception as e:
-            print(f"   ⚠️ Could not load progress file: {e}")
+            print(f"   [WARN] Could not load progress file: {e}")
             return False
 
 
@@ -202,7 +211,7 @@ def check_and_filter_urls(input_file: str, output_dir: str = "output", force_rec
     print(f"\nLoading URLs from: {input_file}")
     with open(input_file, 'r') as f:
         urls = [line.strip() for line in f if line.strip()]
-    print(f"   └─ Loaded {len(urls)} URLs")
+    print(f"   -> Loaded {len(urls)} URLs")
     
     # Create processor
     processor = URLProcessor(output_dir)
@@ -245,6 +254,6 @@ if __name__ == "__main__":
     unprocessed = check_and_filter_urls(input_file, output_dir)
     
     if unprocessed:
-        print(f"\n✅ Ready to process {len(unprocessed)} new URLs")
+        print(f"\n[READY] Ready to process {len(unprocessed)} new URLs")
     else:
         print(f"\n✨ All URLs have been processed!")

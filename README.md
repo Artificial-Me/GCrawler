@@ -15,75 +15,42 @@ A high-performance, stealth web crawler and scraper with advanced anti-detection
 - **GUI Dashboard**: Modern ttkbootstrap-based interface for easy configuration and monitoring
 - **Progress Tracking**: Real-time statistics on crawl progress, success rates, and speed
 
-![GhostCrawler GUI Dashboard](public/gui.png)
+![GhostCrawler GUI Dashboard](public/gui_v1.png)
 
-## Installation
-
-### Prerequisites
-- Python 3.8 or higher
-- Windows, macOS, or Linux
 
 ### Setup
-1. Clone the repository:
-```bash
-git clone https://github.com/yourusername/MOTORMIA-GhostCrawler.git
-cd MOTORMIA-GhostCrawler
-```
+1. Clone the repository
+2. Install dependencies
 
-2. Install dependencies:
-```bash
-pip install -r requirements.txt
-```
+# Install camoufox with GeoIP
 
-3. Install Camoufox with optional features:
 ```bash
-# Install camoufox with GeoIP support for location-based browsing
 pip install 'camoufox[geoip]'
-
-# Or install all optional dependencies
-pip install 'camoufox[all]'
 ```
 
-4. Fetch Camoufox browser:
+# Download Camoufox binary (Add to your PATH)
+
 ```bash
-# Download the Camoufox browser binary
 camoufox fetch
 ```
 
-5. Install Playwright browsers:
+# Add Camoufox to your PATH
+
 ```bash
-playwright install
+export PATH=$PATH:/path/to/camoufox
 ```
 
-6. Install additional GUI dependencies (if using GUI):
+# Install additional GUI dependencies (if using GUI)
+
 ```bash
 pip install ttkbootstrap
 ```
 
-## Usage
-
-### Command Line Interface
-
-#### Basic Usage
-```bash
-python ghostcrawler.py input_urls.txt
-```
-
-#### With Options
-```bash
-python ghostcrawler.py input_urls.txt \
-    --output Specs \
-    --batch-size 20 \
-    --delay 0.5 \
-    --browsers 5 \
-    --headless \
-    --force-recrawl
-```
 
 #### Command Line Arguments
 - `input_file`: Path to file containing URLs (one per line)
-- `-o, --output`: Output directory (default: Specs)
-- `-b, --batch-size`: Number of URLs to process in parallel (default: 10)
+- `-o, --output`: Output directory (default: specs/output)
+- `-b, --batch-size`: Number of URLs to process in parallel (default: 20)
 - `-d, --delay`: Delay between URLs in seconds (default: 1.0)
 - `--browsers`: Number of concurrent browsers (default: 2)
 - `--headless`: Run browsers in headless mode
@@ -99,7 +66,7 @@ python ghostcrawler.py input_urls.txt \
 
 Launch the GUI dashboard:
 ```bash
-python ghostcrawler_gui.py
+python ghostcrawler_auto_gui.py
 ```
 
 The GUI provides:
@@ -112,6 +79,7 @@ The GUI provides:
 ### Interactive Mode
 
 Run without arguments for interactive configuration:
+
 ```bash
 python ghostcrawler.py
 ```
@@ -122,31 +90,9 @@ This will guide you through:
 3. Crawler configuration options
 4. Proxy selection
 
-## Configuration
-
-### Proxy Configuration
-
-Create a `proxy.json` file:
-```json
-{
-  "proxies": [
-    {
-      "id": 1,
-      "name": "Premium Proxy US",
-      "url": "http://username:password@proxy.example.com:8080"
-    },
-    {
-      "id": 2,
-      "name": "Residential Proxy EU",
-      "url": "socks5://user:pass@proxy2.example.com:1080"
-    }
-  ]
-}
-```
-
 ### Environment Variables
 
-Create a `.env` file for default proxy settings:
+The `.env` file is used for default proxy settings:
 ```env
 BRD_SERVER=http://proxy.example.com:8080
 BRD_USERNAME=your_username
@@ -157,7 +103,7 @@ BRD_PASSWORD=your_password
 
 Crawled data is organized by manufacturer:
 ```
-Specs/
+output/
 ├── toyota/
 │   └── TOYOTA_RAW_HTML/
 │       ├── 123-camry-2024.html

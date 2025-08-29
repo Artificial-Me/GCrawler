@@ -21,12 +21,12 @@ from ttkbootstrap.scrolled import ScrolledText
 from ttkbootstrap.dialogs import Messagebox
 import psutil
 
-from ghostcrawler import (
+from ghostcrawler_auto_specs import (
     GhostCrawler, CrawlerConfig, 
     load_proxies_from_file, parse_proxy_url,
     validate_and_deduplicate_urls, resolve_proxy_config
 )
-from url_processor import check_and_filter_urls, filter_urls_from_file
+from utils.url_processor import check_and_filter_urls, filter_urls_from_file
 
 
 class SystemMonitor(ttk.Frame):
