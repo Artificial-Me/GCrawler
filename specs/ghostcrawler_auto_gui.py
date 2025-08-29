@@ -45,7 +45,7 @@ class SystemMonitor(ttk.Frame):
         self.cpu_var = ttk.DoubleVar(value=0)
         self.cpu_progress = ttk.Progressbar(
             self.cpu_frame, variable=self.cpu_var, 
-            maximum=100, bootstyle="success-striped"
+            maximum=100, style="Torque.Horizontal.TProgressbar"
         )
         self.cpu_progress.pack(side=LEFT, fill=X, expand=True, padx=(5, 10))
         self.cpu_label = ttk.Label(self.cpu_frame, text="0%", width=8)
@@ -131,15 +131,15 @@ class CrawlerStats(ttk.Frame):
         row1.pack(fill=X, pady=2)
         
         ttk.Label(row1, text="URLs Processed:", font=("", 9, "bold")).pack(side=LEFT, padx=(0, 5))
-        self.processed_label = ttk.Label(row1, text="0", bootstyle="success")
+        self.processed_label = ttk.Label(row1, text="0", foreground="#62E4D5")
         self.processed_label.pack(side=LEFT, padx=(0, 15))
         
         ttk.Label(row1, text="Failed:", font=("", 9, "bold")).pack(side=LEFT, padx=(0, 5))
-        self.failed_label = ttk.Label(row1, text="0", bootstyle="danger")
+        self.failed_label = ttk.Label(row1, text="0", foreground="#F94868")
         self.failed_label.pack(side=LEFT, padx=(0, 15))
         
         ttk.Label(row1, text="Success Rate:", font=("", 9, "bold")).pack(side=LEFT, padx=(0, 5))
-        self.success_rate_label = ttk.Label(row1, text="0%", bootstyle="info")
+        self.success_rate_label = ttk.Label(row1, text="0%", foreground="#62E4D5")
         self.success_rate_label.pack(side=LEFT)
         
         # Row 2
@@ -186,9 +186,12 @@ class GhostCrawlerGUI:
     """Main GUI Application for GhostCrawler"""
     
     def __init__(self):
-        self.root = ttk.Window(themename="solar")
+        self.root = ttk.Window(themename="darkly")
         self.root.title("GhostCrawler Dashboard")
         self.root.geometry("1400x900")
+        
+        # Apply custom brand colors
+        self.apply_brand_colors()
         
         # Make window responsive
         self.root.columnconfigure(0, weight=1)
@@ -216,6 +219,35 @@ class GhostCrawlerGUI:
         
         # Start message processor
         self.process_messages()
+    
+    def apply_brand_colors(self):
+        """Apply custom brand colors to the application"""
+        style = ttk.Style()
+        
+        # Brand colors
+        REDLINE = "#F94868"
+        TORQUE = "#62E4D5"
+        CARBON = "#1A1A1E"
+        ASPHALT = "#353541"
+        CEMENT = "#EBECED"
+        CERAMIC = "#FFFFFF"
+        
+        # Configure button styles with brand colors  
+        style.configure("Torque.TButton", background=TORQUE, foreground=CARBON)
+        style.map("Torque.TButton",
+                 background=[('active', REDLINE), ('pressed', REDLINE)])
+        
+        style.configure("Redline.TButton", background=REDLINE, foreground=CERAMIC)
+        style.map("Redline.TButton",
+                 background=[('active', TORQUE), ('pressed', TORQUE)])
+        
+        # Configure progress bar colors
+        style.configure("Torque.Horizontal.TProgressbar", 
+                       troughcolor=CEMENT, 
+                       background=TORQUE,
+                       bordercolor=ASPHALT,
+                       lightcolor=TORQUE,
+                       darkcolor=TORQUE)
         
     def setup_ui(self):
         """Setup the main UI"""
@@ -313,7 +345,7 @@ class GhostCrawlerGUI:
         self.auto_mode_var = ttk.BooleanVar(value=True)
         ttk.Checkbutton(basic_frame, text="Auto Mode (process all)", variable=self.auto_mode_var).grid(row=6, column=0, columnspan=2, sticky=W, pady=2)
         
-        self.new_filter_var = ttk.BooleanVar(value=False)
+        self.new_filter_var = ttk.BooleanVar(value=True)
         ttk.Checkbutton(basic_frame, text="Use New URL Processor", variable=self.new_filter_var).grid(row=7, column=0, columnspan=2, sticky=W, pady=2)
         
         # Middle column - Advanced Settings
@@ -388,7 +420,7 @@ class GhostCrawlerGUI:
         self.progress_var = ttk.DoubleVar()
         self.progress_bar = ttk.Progressbar(
             console_frame, variable=self.progress_var,
-            maximum=100, bootstyle="success-striped"
+            maximum=100, style="Torque.Horizontal.TProgressbar"
         )
         self.progress_bar.grid(row=1, column=0, sticky="ew", pady=(5, 0))
         
@@ -404,14 +436,14 @@ class GhostCrawlerGUI:
         self.start_button = ttk.Button(
             left_buttons, text="🚀 Start Crawling",
             command=self.start_crawling,
-            bootstyle="success", width=20
+            style="Torque.TButton", width=20
         )
         self.start_button.pack(side=LEFT, padx=2)
         
         self.stop_button = ttk.Button(
             left_buttons, text="⏹ Stop",
             command=self.stop_crawling,
-            bootstyle="danger", width=15,
+            style="Redline.TButton", width=15,
             state=DISABLED
         )
         self.stop_button.pack(side=LEFT, padx=2)
@@ -575,7 +607,7 @@ class GhostCrawlerGUI:
             self.headless_var.set(settings.get("headless", True))
             self.force_recrawl_var.set(settings.get("force_recrawl", False))
             self.auto_mode_var.set(settings.get("auto_mode", True))
-            self.new_filter_var.set(settings.get("new_filter", False))
+            self.new_filter_var.set(settings.get("new_filter", True))
             self.request_timeout_var.set(settings.get("request_timeout", 120000))
             self.nav_timeout_var.set(settings.get("navigation_timeout", 60000))
             self.turnstile_timeout_var.set(settings.get("turnstile_timeout", 20000))
@@ -606,7 +638,7 @@ class GhostCrawlerGUI:
             self.headless_var.set(True)
             self.force_recrawl_var.set(False)
             self.auto_mode_var.set(True)
-            self.new_filter_var.set(False)
+            self.new_filter_var.set(True)
             self.request_timeout_var.set(120000)
             self.nav_timeout_var.set(60000)
             self.turnstile_timeout_var.set(20000)

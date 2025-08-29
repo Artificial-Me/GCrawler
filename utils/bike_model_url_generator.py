@@ -42,7 +42,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def load_proxies_from_file(proxy_file: str = "proxy.json") -> List[Dict[str, Any]]:
+def load_proxies_from_file(proxy_file: str = ".config/proxy.json") -> List[Dict[str, Any]]:
     """Load proxy configurations from JSON file"""
     try:
         if not os.path.isabs(proxy_file):
@@ -788,7 +788,7 @@ class InteractiveCLI:
         load_dotenv()
         
     def load_proxies(self) -> List[Dict[str, Any]]:
-        """Load available proxies from proxy.json"""
+        """Load available proxies from .config/proxy.json"""
         return load_proxies_from_file()
     
     def clear_screen(self):
@@ -1135,7 +1135,7 @@ class InteractiveCLI:
             
             elif choice == '2':
                 if not self.proxies:
-                    print("❌ No proxies available in proxy.json")
+                    print("❌ No proxies available in .config/proxy.json")
                     input("Press Enter to continue...")
                     continue
                 
@@ -1391,7 +1391,7 @@ async def main():
     parser.add_argument('--no-stealth', action='store_true',
                        help='Disable stealth mode')
     parser.add_argument('--proxy', type=int,
-                       help='Use proxy by ID from proxy.json')
+                       help='Use proxy by ID from .config/proxy.json')
     parser.add_argument('--list-proxies', action='store_true',
                        help='List available proxies and exit')
     parser.add_argument('-i', '--interactive', action='store_true',
@@ -1403,7 +1403,7 @@ async def main():
     if args.list_proxies:
         proxies = load_proxies_from_file()
         if not proxies:
-            print("[INFO] No proxies found in proxy.json")
+            print("[INFO] No proxies found in .config/proxy.json")
             return
         
         print("[INFO] Available proxies:")

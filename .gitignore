@@ -18,4 +18,10 @@ CLAUDE.md
 specs/input/
 specs/output/
 specs/logs/
+.logs
+agents
 
+streamlit_auto_app.py
+streamlit_bike_app.py
+app.py
+README_HUGGINGFACE.md

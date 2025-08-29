@@ -1,3 +1,4 @@
+# Core web crawling dependencies
 playwright[all]
 camoufox[geoip]
 psutil
@@ -8,4 +9,12 @@ aiofiles
 tenacity
 httpx
 orjson
+
+# GUI dependencies
 ttkbootstrap
+
+# Streamlit dependencies for HuggingFace Spaces
+streamlit
+plotly
+pandas
+streamlit-option-menu

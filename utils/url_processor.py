@@ -18,6 +18,7 @@ class URLProcessor:
         self.output_dir = Path(output_dir)
         self.processed_urls_cache = set()
         self.processed_files_map = {}  # Maps URL to file path
+        self.manufacturer_file_counts = {}  # Track files per manufacturer
         self.stats = {
             'total_input': 0,
             'already_processed': 0,
@@ -26,34 +27,52 @@ class URLProcessor:
         }
     
     def parse_url_to_filename(self, url: str) -> Tuple[str, str, str]:
-        """Parse URL to expected output filename"""
+        """Parse URL to expected output filename - handles both car and motorcycle URLs"""
         try:
             parsed = urlparse(url)
             parts = [p for p in parsed.path.split('/') if p]
             
+            # Handle car URLs: /car-specs/manufacturer/id/filename
             if len(parts) >= 4 and parts[0] == 'car-specs':
                 manufacturer = parts[1]
                 id_part = parts[2]
                 filename = parts[3]
                 
-                # Expected file path
-                expected_filename = f"{id_part}-{filename}"
+                # For car URLs, use id-filename format
+                expected_filename = f"{id_part}-{filename}.html"
                 expected_dir = self.output_dir / manufacturer / f"{manufacturer.upper()}_RAW_HTML"
                 expected_path = expected_dir / expected_filename
                 
                 return manufacturer, expected_filename, str(expected_path)
+            
+            # Handle motorcycle URLs: /motorcycles-specs/manufacturer/model-name
+            elif len(parts) >= 3 and parts[0] == 'motorcycles-specs':
+                manufacturer = parts[1]
+                # For motorcycle URLs, use the full model name as filename
+                if len(parts) == 3:
+                    filename = f"{parts[2]}.html"
+                else:
+                    # Handle URLs with more parts (join them)
+                    filename = f"{'-'.join(parts[2:])}.html"
+                
+                # Motorcycles save directly in manufacturer folder
+                expected_dir = self.output_dir / manufacturer
+                expected_path = expected_dir / filename
+                
+                return manufacturer, filename, str(expected_path)
             
             return None, None, None
         except Exception:
             return None, None, None
     
     def scan_existing_files(self) -> Dict[str, str]:
-        """Scan output directory for existing files"""
+        """Scan output directory for existing files and count per manufacturer"""
         print(f"\n[SCAN] SCANNING EXISTING OUTPUT FILES")
         print(f"   -> Directory: {self.output_dir}")
         
         existing_files = {}
         file_count = 0
+        self.manufacturer_file_counts = {}
         
         if not self.output_dir.exists():
             print(f"   [WARN] Output directory doesn't exist yet")
@@ -62,42 +81,54 @@ class URLProcessor:
         # Scan all manufacturer directories
         for manufacturer_dir in self.output_dir.iterdir():
             if manufacturer_dir.is_dir():
-                # Look for RAW_HTML subdirectory (legacy structure)
+                manufacturer_name = manufacturer_dir.name
+                manufacturer_file_count = 0
+                
+                # Look for RAW_HTML subdirectory (car structure)
                 raw_html_dir = manufacturer_dir / f"{manufacturer_dir.name.upper()}_RAW_HTML"
                 if raw_html_dir.exists():
                     # Scan all HTML files in RAW_HTML subdirectory
                     for file_path in raw_html_dir.glob("*.html"):
                         file_count += 1
-                        # Store by filename for quick lookup
-                        existing_files[file_path.name] = str(file_path)
+                        manufacturer_file_count += 1
+                        # Store full path for accurate lookup
+                        existing_files[str(file_path)] = str(file_path)
                         
                         if file_count % 1000 == 0:
                             print(f"      -> Scanned {file_count} files...")
-                else:
-                    # Scan HTML files directly in manufacturer directory (current structure)
-                    for file_path in manufacturer_dir.glob("*.html"):
-                        file_count += 1
-                        # Store by filename for quick lookup
-                        existing_files[file_path.name] = str(file_path)
-                        
-                        if file_count % 1000 == 0:
-                            print(f"      -> Scanned {file_count} files...")
+                
+                # Also scan HTML files directly in manufacturer directory (motorcycle structure)
+                for file_path in manufacturer_dir.glob("*.html"):
+                    file_count += 1
+                    manufacturer_file_count += 1
+                    # Store full path for accurate lookup
+                    existing_files[str(file_path)] = str(file_path)
+                    
+                    if file_count % 1000 == 0:
+                        print(f"      -> Scanned {file_count} files...")
+                
+                if manufacturer_file_count > 0:
+                    self.manufacturer_file_counts[manufacturer_name] = manufacturer_file_count
+                    print(f"   [INFO] {manufacturer_name}: {manufacturer_file_count} files")
         
-        print(f"   [OK] Found {file_count} existing files")
+        print(f"   [OK] Found {file_count} existing files across {len(self.manufacturer_file_counts)} manufacturers")
         self.stats['files_found'] = file_count
         return existing_files
     
     def check_url_processed(self, url: str, existing_files: Dict[str, str]) -> bool:
-        """Check if a URL has already been processed"""
+        """Check if a URL has already been processed by looking for the exact output file"""
         manufacturer, filename, expected_path = self.parse_url_to_filename(url)
         
-        if filename and filename in existing_files:
-            # File exists - URL has been processed
-            self.processed_files_map[url] = existing_files[filename]
+        if not manufacturer or not filename:
+            return False
+        
+        # Check if the expected path exists
+        if expected_path and Path(expected_path).exists():
+            self.processed_files_map[url] = expected_path
             return True
         
-        # Also check if the exact path exists (in case of naming variations)
-        if expected_path and Path(expected_path).exists():
+        # Also check in the existing files dictionary
+        if expected_path in existing_files:
             self.processed_files_map[url] = expected_path
             return True
         

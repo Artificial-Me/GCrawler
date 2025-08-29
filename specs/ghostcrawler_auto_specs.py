@@ -14,6 +14,9 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from playwright.async_api import Page, Browser, Route, async_playwright
 from camoufox import AsyncNewBrowser
 import psutil
+import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'utils'))
 from url_processor import URLProcessor, check_and_filter_urls, filter_urls_from_file
 
 logging.basicConfig(
@@ -26,10 +29,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def load_proxies_from_file(proxy_file: str = "proxy.json") -> List[Dict[str, Any]]:
+def load_proxies_from_file(proxy_file: str = ".config/proxy.json") -> List[Dict[str, Any]]:
     try:
         if not os.path.isabs(proxy_file):
-            proxy_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), proxy_file)
+            # Look for .config/proxy.json in the parent directory (project root)
+            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            proxy_file = os.path.join(project_root, proxy_file)
         if not os.path.exists(proxy_file):
             logger.warning(f"Proxy file {proxy_file} not found")
             return []
@@ -894,7 +899,7 @@ def get_user_input_with_browse():
     force_recrawl = input("   Force recrawl all URLs? (y/N): ").strip().lower() == 'y'
     print(f"   Force recrawl: {'Yes' if force_recrawl else 'No'}")
     
-    use_new_filter = input("   Use new URL processor? (y/N): ").strip().lower() == 'y'
+    use_new_filter = input("   Use new URL processor? (Y/n): ").strip().lower() != 'n'
     print(f"   New URL processor: {'Yes' if use_new_filter else 'No'}")
     
     no_stealth = input("   Disable stealth mode? (y/N): ").strip().lower() == 'y'
@@ -919,7 +924,7 @@ def get_user_input_with_browse():
             else:
                 proxy_name = "No proxy (cancelled)"
         else:
-            print("   No proxies available in proxy.json")
+            print("   No proxies available in .config/proxy.json")
             proxy_name = "No proxy (none available)"
     
     print(f"   Proxy: {proxy_name}\n\n{'='*80}\nCONFIGURATION SUMMARY\n{'='*80}")
@@ -969,8 +974,8 @@ async def main():
         parser.add_argument('--no-stealth', action='store_true', help='Disable stealth mode')
         parser.add_argument('--force-recrawl', action='store_true', help='Force recrawl all URLs (ignore existing files)')
         parser.add_argument('--specs-dir', default='Specs', help='Directory containing existing spec files')
-        parser.add_argument('--use-new-filter', action='store_true', help='Use new URL processor for deduplication')
-        parser.add_argument('--proxy', type=int, help='Proxy ID to use (1-10, see proxy.json)')
+        parser.add_argument('--use-old-filter', action='store_true', help='Use old URL processor (not recommended)')
+        parser.add_argument('--proxy', type=int, help='Proxy ID to use (1-10, see .config/proxy.json)')
         parser.add_argument('--list-proxies', action='store_true', help='List available proxies and exit')
         parser.add_argument('--max-urls', type=int, help='Maximum number of URLs to process (overrides safety limit)')
         parser.add_argument('--auto', action='store_true', help='Automatically process all URLs in input file (no limits)')
@@ -985,7 +990,7 @@ async def main():
         if proxies:
             print("\nAvailable Proxies:")
             for proxy in proxies: print(f"  {proxy['id']}. {proxy['name']}\n     URL: {proxy['url']}")
-        else: print("No proxies found in proxy.json")
+        else: print("No proxies found in .config/proxy.json")
         return
     
     proxy_config = None
@@ -1000,7 +1005,7 @@ async def main():
     
     print(f"\n{'=' * 80}\nGHOSTCRAWLER - INTELLIGENT URL FILTERING\n{'=' * 80}")
     
-    if args.use_new_filter:
+    if not hasattr(args, 'use_old_filter') or not args.use_old_filter:
         urls = check_and_filter_urls(
             args.input_file,
             output_dir=args.output,

@@ -57,7 +57,7 @@ pip install ttkbootstrap
 - `--no-stealth`: Disable stealth mode features
 - `--force-recrawl`: Force recrawl of already processed URLs
 - `--use-new-filter`: Use enhanced URL deduplication processor
-- `--proxy`: Proxy ID to use from proxy.json
+- `--proxy`: Proxy ID to use from .config/proxy.json
 - `--list-proxies`: List available proxies and exit
 - `--max-urls`: Maximum number of URLs to process
 - `--auto`: Process all URLs without limits
